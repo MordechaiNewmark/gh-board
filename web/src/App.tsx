@@ -116,7 +116,7 @@ export default function App() {
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
           <nav aria-label="Repositories" className={cn("border-b bg-muted/40 md:flex md:w-56 md:shrink-0 md:flex-col md:border-b-0 md:border-r", chat && "hidden md:flex")}>
             <div className="p-2 md:p-3">
-              <Input aria-label="Find repository" placeholder="Find or type owner/name" className="bg-card" value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)}
+              <Input aria-label="Find repository" name="repo-search" type="search" autoComplete="off" data-1p-ignore data-lpignore="true" placeholder="Find or type owner/name" className="bg-card" value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && REPO_RE.test(repoQuery.trim())) pickRepo(repoQuery.trim()); }} />
             </div>
             <div className="flex gap-1.5 overflow-x-auto px-2 pb-2 md:block md:overflow-y-auto md:px-2">

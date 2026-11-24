@@ -56,7 +56,7 @@ export function AuthDialog({ open, auth, onOpenChange, onChanged }: Props) {
           )}
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="gh-token">Personal access token</Label>
-            <Input id="gh-token" type="password" autoComplete="off" placeholder="ghp_…" value={token} onChange={(e) => setToken(e.target.value)} onKeyDown={(e) => e.key === "Enter" && connect()} />
+            <Input id="gh-token" name="gh-token" type="password" autoComplete="new-password" data-1p-ignore data-lpignore="true" placeholder="ghp_…" value={token} onChange={(e) => setToken(e.target.value)} onKeyDown={(e) => e.key === "Enter" && connect()} />
           </div>
           <p className="text-xs text-muted-foreground">
             Use a classic token with <code className="font-mono">repo</code> and <code className="font-mono">read:org</code> so repos you were invited to show up.{" "}
