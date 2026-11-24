@@ -8,3 +8,7 @@ server.log
 .repo-cache
 .providers.json
 .providers.json.*.tmp
+.workspaces
+.runs
+.runner.json*
+server.err
