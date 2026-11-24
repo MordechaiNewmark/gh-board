@@ -18,10 +18,18 @@ function createStore<T>() {
     subscribe(f: () => void) { subs.add(f); return () => { subs.delete(f); }; },
   };
 }
-export type Approval = { id: string; state: "pending" | "approved" | "rejected" };
+export type Approval = { id: string; state: "pending" | "approved" | "rejected" | "blocked"; input?: unknown };
 export type GeneratedFile = { id: string; name: string; size: number };
 export const approvals = createStore<Approval>();
 export const generated = createStore<GeneratedFile>();
+/* Latest progress line per tool call (sync_repo: cloning, checking out, indexing). */
+export const progress = createStore<string>();
+/* The repo the board is showing, readable from chat components. */
+const repoStore = createStore<string>();
+export const setChatRepo = (repo: string) => { chatCtx.repo = repo; repoStore.set("repo", repo); };
+export const useChatRepo = () => useSyncExternalStore(repoStore.subscribe, repoStore.snapshot).get("repo") ?? "";
+export const useApprovals = () => useSyncExternalStore(approvals.subscribe, approvals.snapshot);
+export const useProgress = (toolCallId: string) => useSyncExternalStore(progress.subscribe, progress.snapshot).get(toolCallId);
 export const useApproval = (toolCallId: string) => useSyncExternalStore(approvals.subscribe, approvals.snapshot).get(toolCallId);
 export const useGenerated = (toolCallId: string) => useSyncExternalStore(generated.subscribe, generated.snapshot).get(toolCallId);
 
@@ -133,7 +141,11 @@ const adapter: ChatModelAdapter = {
           } else if (ev.type === "approval") {
             const waiting = approvals.snapshot();
             const t = tools().find((p) => p.toolCallId === ev.toolUseId) ?? tools().reverse().find((p) => p.toolName === ev.tool && p.result === undefined && !waiting.has(p.toolCallId));
-            if (t) approvals.set(t.toolCallId, { id: ev.id, state: "pending" });
+            if (t) approvals.set(t.toolCallId, { id: ev.id, state: ev.blocked ? "blocked" : "pending", input: ev.input });
+            changed = true;
+          } else if (ev.type === "progress") {
+            const t = tools().find((p) => p.toolCallId === ev.id) ?? tools().reverse().find((p) => p.toolName === (ev.tool ?? "sync_repo") && p.result === undefined) ?? tools().reverse().find((p) => p.result === undefined);
+            if (t) progress.set(t.toolCallId, String(ev.text ?? ""));
           } else if (ev.type === "file") {
             const t = tools().reverse().find((p) => p.toolName === "generate_file" && !generated.snapshot().has(p.toolCallId));
             if (t) generated.set(t.toolCallId, { id: ev.id, name: ev.name, size: ev.size });

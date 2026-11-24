@@ -12,15 +12,18 @@ import { cn } from "@/lib/utils";
 import { api, errMsg, q, type Auth, type BoardData, type Label, type Meta, type Milestone, type Repo } from "@/lib/api";
 import { AuthDialog } from "./AuthDialog";
 import { IssueDialog, type IssueTarget } from "./IssueDialog";
-import { ChatRuntimeProvider, chatCtx } from "./chat/runtime";
+import { AnalyzeButton, ChatWelcome } from "./chat/Analyze";
+import { ChatRuntimeProvider, chatCtx, setChatRepo } from "./chat/runtime";
 import { Thread } from "./chat/thread";
 import { ToolCard } from "./chat/ToolCard";
+import { ToolGroup } from "./chat/ToolGroup";
 import { Board, BoardSkeleton } from "./views/Board";
 import { Code } from "./views/Code";
 import { Hierarchy, HierarchySkeleton } from "./views/Hierarchy";
 
 type View = "board" | "tree" | "code" | "chat";
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
+const THREAD_COMPONENTS = { ToolFallback: ToolCard, ToolGroup, Welcome: ChatWelcome };
 const EMPTY: BoardData = { columns: [], prefix: "status:", issues: [] };
 
 const stored = (key: string) => { try { return localStorage.getItem(key) ?? ""; } catch { return ""; } };
@@ -110,7 +113,7 @@ export default function App() {
   useEffect(() => { void boot(); }, [boot]);
 
   // Keep the chat in sync with what the board is showing.
-  useEffect(() => { chatCtx.repo = repo; chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => void load(repo); }, [repo, autoApprove, load]);
+  useEffect(() => { setChatRepo(repo); chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => void load(repo); }, [repo, autoApprove, load]);
 
   const pickRepo = (name: string) => { store("repo", name); setRepo(name); setFilter(""); void load(name); };
   const newIssue = useCallback((extra: Partial<IssueTarget> = {}) => {
@@ -289,13 +292,14 @@ export default function App() {
 
           <Splitter {...chatPane.handleProps} />
           <aside id="chat" aria-label="Claude chat" className={cn("min-h-0 flex-1 flex-col bg-background md:flex md:w-[min(var(--chat-w),45vw)] md:flex-none", chat ? "flex" : "hidden")}>
-            <div className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-2.5">
-              <span className="flex items-center gap-2 text-[14px] font-semibold"><SparklesIcon aria-hidden className="size-4 text-brand" />Ask Claude</span>
+            <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-4 py-2">
+              <span className="mr-auto flex items-center gap-2 text-[14px] font-semibold"><SparklesIcon aria-hidden className="size-4 text-brand" />Ask Claude</span>
+              <AnalyzeButton />
               <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
                 <Checkbox checked={autoApprove} onCheckedChange={(v) => setAutoApprove(v === true)} /> Auto-approve writes
               </label>
             </div>
-            <div className="min-h-0 flex-1"><Thread components={{ ToolFallback: ToolCard }} /></div>
+            <div className="min-h-0 flex-1"><Thread components={THREAD_COMPONENTS} /></div>
           </aside>
         </div>
       </div>
