@@ -13,6 +13,7 @@ import { checkPlugin } from './plugin.mjs';
 import { AUTONOMY, buildArgs, buildEnv, permissions, promptFor, resolveClaude, tokenKind, splitList } from './command.mjs';
 import { makeScrubber, parseStreamObject, effectOf, lineSplitter } from './log.mjs';
 import { createWorkspaces, apiReader } from './workspace.mjs';
+import { PRESETS, DEFAULT_PRESET, TIERS, checkTiers } from '../loop/models.mjs';
 
 const num = (v, d, min = 0) => (Number.isFinite(Number(v)) && Number(v) > min ? Number(v) : d);
 const today = () => new Date().toISOString().slice(0, 10);
@@ -340,6 +341,54 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
     return pub(key, full);
   }
 
+  /** Per-repo model policy choice: preset, tier overrides, modules marked sensitive. Local only; nothing reaches GitHub. */
+  function modelChoice(repo) {
+    const m = cfg(parseRepo(repo).key).models || {};
+    return { preset: PRESETS[m.preset] ? m.preset : DEFAULT_PRESET, tiers: m.tiers || {}, sensitive: Array.isArray(m.sensitive) ? m.sensitive : [] };
+  }
+  function setModelChoice(repo, { preset, tiers, sensitive } = {}) {
+    const c = cfg(parseRepo(repo).key);
+    const cur = modelChoice(repo);
+    if (preset !== undefined) { if (!PRESETS[preset]) throw new Error(`Unknown preset "${preset}". Use one of: ${Object.keys(PRESETS).join(', ')}.`); cur.preset = preset; }
+    if (tiers !== undefined) { checkTiers(tiers); cur.tiers = Object.fromEntries(TIERS.filter((t) => String(tiers?.[t] ?? '').trim()).map((t) => [t, String(tiers[t]).trim()])); }
+    if (sensitive !== undefined) cur.sensitive = [...new Set((Array.isArray(sensitive) ? sensitive : []).map((s) => String(s).trim()).filter((s) => /^[\w.-]{1,60}$/.test(s)))];
+    c.models = cur; save();
+    return cur;
+  }
+
+  /**
+   * "Test models": one tiny prompt per model, no tools, no GitHub token, in an empty directory. Never automatic:
+   * it spends a little on each model, so the caller must pass confirm: true.
+   */
+  async function testModels(models, { confirm } = {}) {
+    if (confirm !== true) throw new Error('Confirmation required: the test sends one short prompt to each model.');
+    const list = [...new Set((models || []).map((m) => String(m).trim()).filter(Boolean))].slice(0, 4);
+    const bin = resolveClaude({ env });
+    const cwd = join(dataDir, '.runs', '.model-test');
+    await mkdir(cwd, { recursive: true });
+    const childEnv = buildEnv({ base: env, token: '', claudeEnv: claudeAuth.agentEnv({}), pass: envPass });
+    const scrub = makeScrubber([childEnv.ANTHROPIC_API_KEY, childEnv.CLAUDE_CODE_OAUTH_TOKEN], (x) => claudeAuth.scrub(accounts.scrub(x)));
+    const one = (model) => new Promise((done) => {
+      const args = ['-p', 'Reply with the single word ok.', '--model', model, '--max-turns', '1', '--output-format', 'stream-json', '--verbose', '--tools', '', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--strict-mcp-config', '--no-chrome', '--no-session-persistence'];
+      const started = Date.now();
+      let result = null; let served = ''; let errText = '';
+      const child = spawn(bin.command, [...bin.prefix, ...args], { cwd, env: childEnv, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+      const timer = setTimeout(() => { errText = 'Timed out after 90 seconds.'; killTree(child); }, 90000);
+      const out = lineSplitter((line) => { try { const o = JSON.parse(line); if (o.type === 'system' && o.subtype === 'init') served = o.model || ''; for (const ev of parseStreamObject(o)) if (ev.type === 'result') result = ev; } catch { /* not JSON */ } });
+      child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (d) => out.push(d)); child.stderr.on('data', (d) => { if (errText.length < 600) errText += d; });
+      const finish = (spawnError) => {
+        clearTimeout(timer); out.end();
+        const ok = !!result && !result.isError;
+        done({ model, ok, served, ms: Date.now() - started, costUsd: result?.costUsd || 0, error: ok ? '' : scrub(spawnError?.message || result?.text || errText.trim().split('\n').pop() || 'Claude Code exited without an answer.').slice(0, 300) });
+      };
+      child.on('error', finish); child.on('close', () => finish(null));
+    });
+    const results = [];
+    for (const m of list) results.push(await one(m)); // one at a time: this is a check, not a benchmark
+    return { results, at: new Date().toISOString() };
+  }
+
   /** Past ticks of a repo, newest first, and the events of one. */
   async function history(repo, limit = 20) {
     try { return (await readdir(runsDir(repo))).filter((f) => f.endsWith('.jsonl')).sort().reverse().slice(0, limit).map((f) => f.replace(/\.jsonl$/, '')); } catch { return []; }
@@ -354,5 +403,5 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
   const anyActive = () => [...live.values()].some(active);
   process.once('exit', () => { for (const s of live.values()) killTree(s.child); });
 
-  return { start, stop, stopAll, pause, resume, setup, setAutonomy, status, preflight, readiness: repoReadiness, readerFor, modulesOf, history, log, anyActive, workspaces, limits: lim };
+  return { start, stop, stopAll, pause, resume, setup, setAutonomy, status, preflight, readiness: repoReadiness, readerFor, modulesOf, modelChoice, setModelChoice, testModels, history, log, anyActive, workspaces, limits: lim };
 }

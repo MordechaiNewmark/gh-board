@@ -206,6 +206,24 @@ test('planner chat: issues only. No commit tool, and create_issues builds a back
   assert.deepEqual([board.cards.find((c) => c.number === 31).state, board.cards.find((c) => c.number === 32).state, board.cards.find((c) => c.number === 33).lint.ready], ['ready', 'blocked', false]);
 });
 
+test('model policy over HTTP: defaults, per-repo preset and tiers, risk listing; saving it writes nothing to GitHub', async () => {
+  const before = writes();
+  let p = (await api('/api/models/policy?repo=acme/nogate')).json;
+  assert.deepEqual([p.preset, p.tiers, p.planner.model, p.risk.covered], ['balanced', { cheap: 'sonnet', strong: 'opus', top: 'fable' }, 'fable', true]);
+  assert.equal((await api('/api/auth/status')).json.plannerModel, 'fable', 'the planner defaults to the top tier');
+  assert.deepEqual(p.rows.map((r) => [r.key.replace('MODEL_', ''), r.recommended, r.tier]).slice(0, 6), [['IMPLEMENT_S', 'sonnet', 'cheap'], ['IMPLEMENT_M', 'sonnet', 'cheap'], ['IMPLEMENT_L', 'opus', 'strong'], ['REVIEW', 'fable', 'top'], ['REREVIEW', 'opus', 'strong'], ['PATCH', 'opus', 'strong']]);
+  p = (await api('/api/models/policy', { repo: 'acme/nogate', preset: 'frugal', tiers: { cheap: 'haiku' }, sensitive: ['api'] })).json;
+  assert.deepEqual([p.preset, p.tiers.cheap, p.risk.sensitive, p.risk.covered, p.risk.reviewTier, p.planner.recommended], ['frugal', 'haiku', ['api'], false, 'strong', 'opus']);
+  assert.deepEqual(p.risk.tasks.map((t) => [t.number, t.why]), [[4, 'module:api is marked sensitive'], [10, 'module:api is marked sensitive'], [11, 'module:api is marked sensitive']]);
+  assert.match(p.diff, /\+MODEL_IMPLEMENT_S="haiku"/);
+  assert.equal((await api('/api/models/policy?repo=team/loop')).json.preset, 'balanced', 'the choice is per repo');
+  assert.match((await api('/api/models/policy', { repo: 'acme/nogate', preset: 'nope' })).json.error, /Unknown preset/);
+  assert.match((await api('/api/models/test', { repo: 'acme/nogate' })).json.error, /Confirmation required/);
+  const t = (await api('/api/models/test', { repo: 'acme/nogate', confirm: true })).json;
+  assert.deepEqual(t.results.map((x) => [x.model, x.ok]), [['haiku', true], ['opus', true], ['fable', true]]);
+  assert.equal(writes(), before, 'no write reached GitHub');
+});
+
 test('no token appears in any response or in the server log', async () => {
   await new Promise((r) => setTimeout(r, 200));
   const all = bodies.join('\n') + out;

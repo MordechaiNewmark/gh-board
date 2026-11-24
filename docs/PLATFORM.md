@@ -228,70 +228,116 @@ This policy is the user's judgment. It is not something the talk tested.
 converges: a weak writer mostly costs retries. A weak reviewer is the dangerous case, because it lets bugs through
 with false confidence. So:
 
-1. The **strongest** model plans and writes specs (what to build), and reviews.
-2. A **cheaper, faster** model implements inside tight constraints (lint, types, tests, banned patterns).
+1. The strongest model plans and writes specs (what to build), and does the independent review.
+2. A cheaper, faster model implements inside tight constraints (lint, types, tests, banned patterns).
 3. **Deterministic checks run before any model review.** The implementer must pass the gate before opening a PR,
    and the reviewer skill refuses a PR with a failing check. A model judges intent and design, not what a linter
    can catch.
 4. The reviewer is **independent**: fresh context (the plugin enforces it) and, where possible, a different model
-   than the writer.
-5. **Escalate the writer** to the strong model when the cheap one keeps failing.
+   than the writer. **A reviewer is never a lower tier than an implementer.**
+5. Escalate the writer to a stronger model when the cheap one keeps failing.
 
 **Caveats.** Hard or novel work (algorithms, concurrency, unfamiliar domains) still needs a strong writer: raise
-`MODEL_IMPLEMENT_M`, or label the task so it is split. Retry cost can exceed the savings if the weak writer needs
-many attempts; that is what the Phase 4 metric below is for.
+`MODEL_IMPLEMENT_M` for that repo, or split the task. Retry cost can exceed the savings if the weak writer needs
+many attempts; the Phase 4 metric "retries per task by implementer model" exists to show that.
 
-### How it maps onto the plugin's existing keys
+### Three tiers
 
-The fork (`cost-aware-defaults`, v0.1.5) resolves these in `scripts/lib/config.sh` (defaults < `delivery.conf` <
-environment) and `delivery-tick` passes each value to the Agent tool's `model` input; empty means "inherit the
-session model". The values are Claude Code model aliases (`opus`, `sonnet`, `haiku`, `fable`). No new keys.
+| Tier | `.env` | Default | Resolves to | Notes |
+| --- | --- | --- | --- | --- |
+| cheap | `CHEAP_MODEL` | `sonnet` | `claude-sonnet-5-5` | The writer for small, tightly checked tasks |
+| strong | `STRONG_MODEL` | `opus` | `claude-opus-5-5` | Re-review, patching, large tasks |
+| top | `TOP_MODEL` | `fable` | `claude-fable-5-2` | The strongest and most expensive: planning and first review |
 
-| Key | Used for | Preset | Why |
-| --- | --- | --- | --- |
-| `MODEL_IMPLEMENT_S` | Implementer, `size:S` | cheap (`sonnet`) | Small, tightly checked |
-| `MODEL_IMPLEMENT_M` | Implementer, `size:M` | cheap (`sonnet`) | Raise for hard tasks |
-| `MODEL_IMPLEMENT_L` | Implementer, `size:L` | strong (`opus`) | Large work; normally split first |
-| `MODEL_REVIEW` | First review | strong | The control |
-| `MODEL_REREVIEW` | Review after a patch | strong | Where false confidence gets in |
-| `MODEL_PATCH` | Patcher | strong | Escalation after a failed review or red CI |
-| `REREVIEW_SCOPE` | Re-review breadth | `narrow` | Keeps the strong re-review affordable |
+Values are Claude Code model aliases because the plugin hands them to the Agent tool's `model` input, which takes
+aliases (`sonnet`, `opus`, `fable`, `haiku`); `claude --model` accepts the same aliases and full ids. Each
+repo can override the three models and pick a preset in its Model policy panel (Repo tab). Those choices are stored
+on this machine in `.runner.json`; they are inputs to the diff below, not a second source of truth.
 
-`STRONG_MODEL` and `CHEAP_MODEL` in `.env` choose the two aliases (defaults `opus` and `sonnet`). The planner chat
-uses the strong model unless Settings > Claude > Model says otherwise; that setting no longer leaks into the
-loop (the orchestrator session inherits your Claude Code default, or `RUNNER_MODEL`).
+### Presets (per repo; default Balanced)
 
-**Applying it.** The Repo tab shows current values, the preset and the exact diff of `.claude/delivery.conf`.
-gh-board does not write the file or open a PR itself: you copy the diff, or click "Ask the planner to file a task"
-and the change arrives like any other, through a task, a PR and your merge. Nothing is pushed to the base branch.
+| Role | Key | Balanced `$$` | Frugal `$` | Max quality `$$$` |
+| --- | --- | --- | --- | --- |
+| Planner chat, spec authoring, decompose | (Settings / session model) | top | strong | top |
+| Implementer `size:S` | `MODEL_IMPLEMENT_S` | cheap | cheap | cheap |
+| Implementer `size:M` | `MODEL_IMPLEMENT_M` | cheap | cheap | cheap |
+| Implementer `size:L` | `MODEL_IMPLEMENT_L` | strong | strong | top |
+| First review | `MODEL_REVIEW` | **top** | strong | top |
+| Re-review after a patch | `MODEL_REREVIEW` | strong | strong | top |
+| Patcher | `MODEL_PATCH` | strong | strong | top |
+| Re-review scope | `REREVIEW_SCOPE` | narrow | narrow | narrow |
 
-**Availability and cost.** Model availability can only be checked for an Anthropic API key (a free models list).
-For a subscription sign-in the panel says so and lists the names Claude Code offers, unverified. On a subscription
-the strong model draws down usage limits fastest; if reviews stall on rate limits, set `MODEL_REREVIEW` to the
-cheap model and accept a weaker re-review. On an API key, reviews are billed per token but read a diff and run
-commands, so they are usually much smaller than the implementation they check.
+Why Balanced looks like this:
 
-### Gap: "escalate after two failed gate runs" (proposed plugin change, not made)
+- **Planning on top.** An issue is the prompt every later agent runs from; a mistake there is paid for in every
+  implementation, review and patch that follows. It is also the lowest-volume role, so the top model costs least
+  here. `/delivery-loop:author-spec` and `decompose` have no model key in the plugin: they run on the model of the
+  session you start them in, so run them with the top model (the planner chat does this by default).
+- **First review on top.** The first review is the control that decides what reaches you, and the plugin has no
+  way to tell a risky change from a safe one, so the only way to give risky changes the top model is to give it to
+  every first review. That is the main cost of Balanced: one top-tier session per PR. Reviews read a diff and run
+  commands, so they are much smaller than the implementation they check, but on a subscription the top model draws
+  down usage limits fastest. If reviews stall on limits, switch that repo to Frugal.
+- **Re-review on strong.** With `REREVIEW_SCOPE=narrow` it covers an incremental diff, the failing criteria and the
+  gate. It is still at least the tier of every writer, including the patcher.
+- **Patch on strong.** The closest the plugin gets to "escalate when the cheap writer fails" (see the gap below).
+- **`size:L` on strong.** Mostly theoretical: `size:L` is never claimable and is split first.
 
-The plugin cannot express this rule today:
+The reviewer is a different model than the S/M implementer in all three presets, and never a lower tier than any
+implementer. `MODEL_REREVIEW` equals `MODEL_IMPLEMENT_L` in Balanced and Frugal; that is the same tier, which is
+allowed, and `size:L` is rarely implemented at all.
 
-- `MODEL_PATCH` applies from the **first** patch round, not after two failures. Setting it to the strong model is
-  the closest available behaviour ("escalate as soon as the cheap writer fails review or CI") and is what the preset
-  does. It is more expensive than the stated rule on the first retry and never cheaper.
-- Gate failures **inside** the implementer's own session (before a PR exists) are invisible to the orchestrator, so
-  nothing can count them.
+### What the panel and the server do
 
-Proposed change to the fork (to be filed as an issue there; the delivery-loop repo was not edited):
+- Show, per role: the value now in `delivery.conf`, its tier chip (cheap / strong / top, or "no tier" for an empty
+  or unknown value), the resolved model id, and the preset value.
+- **Validate** (`loop/models.mjs`, `validate`): an error when `MODEL_REVIEW` or `MODEL_REREVIEW` is a lower tier than
+  any `MODEL_IMPLEMENT_*`; warnings when a reviewer is empty (it inherits the session model, so its tier is unknown),
+  is outside the tiers, or is the same model as an implementer. Both the file's current values and the preset (after
+  tier overrides) are checked.
+- Show the exact diff of `.claude/delivery.conf`. gh-board does not write the file or open a PR: you copy the diff,
+  or click "Ask the planner to file a task", and the change arrives through a task, a PR and your merge.
+- **Test models**: a button, never automatic. After a confirmation it sends one prompt per tier
+  (`claude -p "Reply with the single word ok." --model <m> --max-turns 1 --tools ""`, no GitHub token, empty
+  directory) and shows which model answered or the error. For a subscription sign-in this is the only way to know;
+  an API key can list models for free.
+  Checked once by hand on the user's Max-plan login while building this: `opus` answered as `claude-opus-5-5` and
+  `claude-fable-5-2` answered as itself. `sonnet` was the session default in an earlier smoke run. No tier failed.
+- The planner chat uses the tier the selected repo's preset gives the planner (top by default) unless
+  Settings > Claude > Planner model is set. Loop sessions do not use that setting: the orchestrator inherits your
+  Claude Code default, or `RUNNER_MODEL`.
 
-1. New keys `MODEL_PATCH_ESCALATED` (default empty = `MODEL_PATCH`) and `PATCH_ESCALATE_AFTER` (default `2`).
-   `delivery-tick` already reads the latest `Patch iteration: n/3` comment to bound the loop; it would pass
-   `MODEL_PATCH_ESCALATED` when `n >= PATCH_ESCALATE_AFTER`.
-2. Optionally `MODEL_IMPLEMENT_RETRY`: used when a task is re-claimed after an implementer gave up (`RECLAIMED` in
-   the claim ledger), which is the observable form of "the cheap writer could not pass the gate".
-3. The six-place checklist in the plugin's CLAUDE.md applies (config.sh, init, delivery-config, README, spec,
-   config-test).
+### Risk-based review (designed; only the display is built)
 
-Until then gh-board keeps `MODEL_PATCH` strong and measures retries (Phase 4).
+Goal: review risky changes with the top model without paying for it on every PR (what Frugal would need).
+
+What exists: a task labeled `risk:high`, or in a module you mark **sensitive** in the panel, is listed there with
+the tier its first review will get under the current preset and the suggested tier (top). Under Balanced and Max
+quality they are already covered; under Frugal the panel says they are not.
+
+What cannot be done without a plugin change: choosing the review model **per task**. `delivery.conf` has one
+`MODEL_REVIEW`; the orchestrator skill reads it from the file inside the session; and a tick decides which PR to
+review only after it starts. The runner could rewrite the workspace's `delivery.conf` before a tick, or steer the
+orchestrator through the system prompt, but both are fragile (a parallel tick reviews several PRs with one value;
+prompt steering fights the skill's own rule to keep dispatch prompts to one line) and both put policy somewhere the
+repo does not record. So gh-board does not select the tier per run.
+
+### Proposed plugin changes (not made; the delivery-loop repo was not edited)
+
+1. **Risk-based review.** New key `MODEL_REVIEW_HIGH_RISK` (default empty = `MODEL_REVIEW`) and
+   `HIGH_RISK_MODULES` (space-separated). `delivery-tick` step 4 passes `MODEL_REVIEW_HIGH_RISK` when the linked
+   issue carries `risk:high` or its `module:` is listed; `init` creates the `risk:high` label; the planner sets it.
+   With this, Frugal plus top-tier review of risky tasks becomes the natural default.
+2. **Escalate after two failed attempts.** `MODEL_PATCH` applies from the **first** patch round, and gate failures
+   inside the implementer's own session are invisible to the orchestrator, so "escalate after two failed gate runs"
+   cannot be expressed. New keys `MODEL_PATCH_ESCALATED` (default empty = `MODEL_PATCH`) and
+   `PATCH_ESCALATE_AFTER` (default `2`): `delivery-tick` already reads the latest `Patch iteration: n/3` comment and
+   would pass the escalated model when `n >= PATCH_ESCALATE_AFTER`. Then the presets could patch on cheap first.
+3. Optionally `MODEL_IMPLEMENT_RETRY` for a task re-claimed after an implementer gave up (`RECLAIMED` in the
+   claim ledger), the observable form of "the cheap writer could not pass the gate".
+
+Each needs the plugin's six-place checklist (config.sh, init, delivery-config, README, spec, config-test). Until
+then gh-board keeps `MODEL_PATCH` at strong or above and measures retries (Phase 4).
 
 ## 7. Phase plan
 

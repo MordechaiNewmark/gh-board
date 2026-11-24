@@ -234,31 +234,77 @@ test('planner prompt: issues only, the plugin conventions, the repo gate and mod
   assert.match(plannerPrompt({ repo: 'a/b', loop: null, readOnly: true }), /READ-ONLY mode/);
 });
 
-test('model policy: review side strongest, mapped onto the keys the plugin already reads; applying is a diff, not a write', async () => {
-  const { modelPolicy, recommended, applyToConf, aliasOf, MODEL_KEYS } = await import('../loop/models.mjs');
+test('model tiers and presets: cheap < strong < top, mapped onto the keys the plugin already reads', async () => {
+  const { recommended, PRESETS, DEFAULT_PRESET, DEFAULT_TIERS, MODEL_KEYS, TIERS, checkTiers, tierOf, resolveId, aliasOf } = await import('../loop/models.mjs');
   assert.deepEqual(MODEL_KEYS, ['MODEL_IMPLEMENT_S', 'MODEL_IMPLEMENT_M', 'MODEL_IMPLEMENT_L', 'MODEL_REVIEW', 'MODEL_REREVIEW', 'MODEL_PATCH', 'REREVIEW_SCOPE']);
   assert.ok(MODEL_KEYS.every((k) => k in parseConf('').values), 'no key the plugin does not have');
-  const rec = recommended({ strong: 'opus', cheap: 'haiku' });
-  assert.deepEqual(MODEL_KEYS.map((k) => rec[k].value), ['haiku', 'haiku', 'opus', 'opus', 'opus', 'opus', 'narrow']);
+  assert.deepEqual([TIERS, DEFAULT_TIERS, DEFAULT_PRESET], [['cheap', 'strong', 'top'], { cheap: 'sonnet', strong: 'opus', top: 'fable' }, 'balanced']);
+  const vals = (preset) => { const r = recommended({ preset }); return MODEL_KEYS.map((k) => r[k].value); };
+  //                      IMPL_S    IMPL_M    IMPL_L   REVIEW   REREVIEW  PATCH    SCOPE
+  assert.deepEqual(vals('balanced'), ['sonnet', 'sonnet', 'opus', 'fable', 'opus', 'opus', 'narrow']);
+  assert.deepEqual(vals('frugal'), ['sonnet', 'sonnet', 'opus', 'opus', 'opus', 'opus', 'narrow']);
+  assert.deepEqual(vals('max'), ['sonnet', 'sonnet', 'fable', 'fable', 'fable', 'fable', 'narrow']);
+  assert.deepEqual(vals('nonsense'), vals('balanced'), 'an unknown preset falls back to Balanced');
+  assert.deepEqual(Object.values(PRESETS).map((p) => [p.title, p.cost, p.planner]), [['Balanced', '$$', 'top'], ['Frugal', '$', 'strong'], ['Max quality', '$$$', 'top']]);
+  assert.deepEqual(recommended({ preset: 'balanced', tiers: { cheap: 'haiku', strong: 'sonnet', top: 'claude-opus-5-5' } }).MODEL_REVIEW, { value: 'claude-opus-5-5', tier: 'top', why: recommended().MODEL_REVIEW.why });
+  assert.deepEqual(checkTiers({ cheap: ' haiku ', top: '' }), { cheap: 'haiku', strong: 'opus', top: 'fable' });
+  assert.throws(() => checkTiers({ top: 'rm -rf /' }), /does not look like a model name/);
   assert.deepEqual(['claude-opus-5-5', 'claude-fable-5-2', 'sonnet', 'gpt-9'].map(aliasOf), ['opus', 'fable', 'sonnet', '']);
-  const conf = `${CONF}MODEL_REVIEW="sonnet"   # first review\nMODEL_PATCH=""\n`;
-  const next = applyToConf(conf, { MODEL_REVIEW: 'opus', MODEL_PATCH: 'opus', MODEL_IMPLEMENT_S: 'sonnet' });
-  assert.match(next, /^MODEL_REVIEW="opus"   # first review$/m);
+  assert.deepEqual(['fable', 'claude-fable-5-2', 'opus', 'sonnet', '', 'haiku'].map((v) => tierOf(v, DEFAULT_TIERS)), ['top', 'top', 'strong', 'cheap', '', '']);
+  const ids = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2'];
+  assert.deepEqual(['fable', 'opus', 'claude-sonnet-5-5', 'mystery', ''].map((v) => resolveId(v, ids)), ['claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'mystery', '']);
+});
+
+test('model validation: a reviewer is never a lower tier than an implementer', async () => {
+  const { validate, recommended, DEFAULT_TIERS: T, MODEL_KEYS, PRESETS } = await import('../loop/models.mjs');
+  const of = (preset) => { const r = recommended({ preset }); return Object.fromEntries(MODEL_KEYS.map((k) => [k, r[k].value])); };
+  for (const p of Object.keys(PRESETS)) assert.deepEqual(validate(of(p), T), [], `${p} is valid as shipped`);
+  const errors = (v) => validate(v, T).filter((x) => x.level === 'error').map((x) => x.message);
+  const weak = errors({ ...of('balanced'), MODEL_REVIEW: 'sonnet' });
+  assert.equal(weak.length, 1);
+  assert.match(weak[0], /REVIEW \(cheap: sonnet\) is a lower tier than IMPLEMENT_L \(strong: opus\)/);
+  assert.equal(errors({ ...of('max'), MODEL_REREVIEW: 'opus' }).length, 1, 're-review on strong under a top-tier writer');
+  assert.deepEqual(errors({ ...of('frugal'), MODEL_IMPLEMENT_M: 'fable' }).length, 2, 'both reviewers are outranked');
+  const warns = (v, t = T) => validate(v, t).filter((x) => x.level === 'warn').map((x) => x.message).join('\n');
+  assert.match(warns({ ...of('balanced'), MODEL_REVIEW: '' }), /REVIEW is empty: the reviewer inherits the session model/);
+  assert.match(warns({ ...of('balanced'), MODEL_REVIEW: 'haiku' }), /not one of the three tiers/);
+  assert.match(warns({ ...of('balanced'), MODEL_REVIEW: 'sonnet', MODEL_REREVIEW: 'sonnet', MODEL_IMPLEMENT_L: 'sonnet' }), /REVIEW and IMPLEMENT_S are the same model \(sonnet\)/);
+  assert.match(warns({ ...of('balanced'), MODEL_IMPLEMENT_S: '' }), /implementer key is empty/);
+  assert.match(warns(of('balanced'), { cheap: 'opus', strong: 'opus', top: 'fable' }), /CHEAP_MODEL and STRONG_MODEL are the same model/);
+});
+
+test('model policy panel: current values, tiers, the diff to apply, risk, and honest notes. Nothing is written', async () => {
+  const { modelPolicy, applyToConf } = await import('../loop/models.mjs');
+  const ids = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2'];
+  const conf = `${CONF}MODEL_REVIEW="sonnet"   # first review\nMODEL_IMPLEMENT_L="opus"\nMODEL_PATCH=""\n`;
+  const next = applyToConf(conf, { MODEL_REVIEW: 'fable', MODEL_PATCH: 'opus', MODEL_IMPLEMENT_S: 'sonnet' });
+  assert.match(next, /^MODEL_REVIEW="fable"   # first review$/m);
   assert.match(next, /# Model allocation: the review side is strongest[^\n]*\nMODEL_IMPLEMENT_S="sonnet"\n$/);
   assert.equal(parseConf(next).values.GATE_CMD, 'bash scripts/check.sh', 'the rest of the file is untouched');
-  const p = await modelPolicy(reader({ '.claude/delivery.conf': conf }), { strong: 'opus', cheap: 'sonnet', available: { ids: ['claude-opus-5-5', 'claude-sonnet-5-5'], verified: false }, billing: 'subscription' });
-  assert.deepEqual(p.changes, { MODEL_IMPLEMENT_S: 'sonnet', MODEL_IMPLEMENT_M: 'sonnet', MODEL_IMPLEMENT_L: 'opus', MODEL_REVIEW: 'opus', MODEL_REREVIEW: 'opus', MODEL_PATCH: 'opus' });
+
+  const risky = [{ number: 12, title: 'Timezones', state: 'ready', why: 'risk:high' }];
+  const p = await modelPolicy(reader({ '.claude/delivery.conf': conf }), { available: { ids, verified: false }, billing: 'subscription', risky, sensitive: ['api'] });
+  assert.deepEqual([p.preset, p.tiers, p.tierIds], ['balanced', { cheap: 'sonnet', strong: 'opus', top: 'fable' }, { cheap: 'claude-sonnet-5-5', strong: 'claude-opus-5-5', top: 'claude-fable-5-2' }]);
+  assert.deepEqual(p.changes, { MODEL_IMPLEMENT_S: 'sonnet', MODEL_IMPLEMENT_M: 'sonnet', MODEL_REVIEW: 'fable', MODEL_REREVIEW: 'opus', MODEL_PATCH: 'opus' });
+  const review = p.rows.find((r) => r.key === 'MODEL_REVIEW');
+  assert.deepEqual([review.current, review.currentTier, review.currentId, review.recommended, review.tier, review.id, review.matches], ['sonnet', 'cheap', 'claude-sonnet-5-5', 'fable', 'top', 'claude-fable-5-2', false]);
+  assert.match(p.problems.find((x) => x.level === 'error').message, /REVIEW \(cheap: sonnet\) is a lower tier than IMPLEMENT_L/, 'what is in the file today is validated');
+  assert.deepEqual(p.presetProblems, []);
   assert.match(p.diff, /^--- a\/\.claude\/delivery\.conf\n\+\+\+ b\/\.claude\/delivery\.conf\n/);
-  assert.match(p.diff, /-MODEL_REVIEW="sonnet"   # first review\n\+MODEL_REVIEW="opus"   # first review/);
-  assert.match(p.diff, /\+MODEL_IMPLEMENT_S="sonnet"/);
-  assert.deepEqual([p.inPolicy, p.planner], [false, { model: 'opus', source: 'default' }]);
-  assert.match(p.notes.join('\n'), /availability was not verified/);
-  assert.match(p.notes.join('\n'), /usage limits/);
-  assert.match(p.notes.join('\n'), /no "escalate after two failed gate runs" rule/);
-  assert.match(p.task, /module:infra task.*MODEL_PATCH="opus"/s);
-  const done = await modelPolicy(reader({ '.claude/delivery.conf': applyToConf(conf, p.changes) }), { available: { ids: ['claude-opus-5-5', 'claude-sonnet-5-5'], verified: true }, billing: 'api' });
-  assert.deepEqual([done.inPolicy, done.diff, done.task], [true, '', '']);
-  const odd = await modelPolicy(reader({}), { strong: 'fable', cheap: 'fable', available: { ids: ['claude-opus-5-5'], verified: true } });
+  assert.match(p.diff, /-MODEL_REVIEW="sonnet"   # first review\n\+MODEL_REVIEW="fable"   # first review/);
+  assert.deepEqual(p.planner, { model: 'fable', tier: 'top', source: 'preset', recommended: 'fable', recommendedTier: 'top', id: 'claude-fable-5-2' });
+  assert.deepEqual(p.risk, { sensitive: ['api'], tasks: risky, reviewTier: 'top', suggestedTier: 'top', covered: true, perTask: false });
+  assert.match(p.notes.join('\n'), /not verified.*Test models/s);
+  assert.match(p.notes.join('\n'), /every first review runs on the top model \("fable"\).*usage limits/s);
+  assert.match(p.notes.join('\n'), /no "escalate after two failed gate runs" rule and no per-task review tier/);
+  assert.match(p.task, /"Balanced" model allocation.*MODEL_REVIEW="fable"/s);
+
+  const frugal = await modelPolicy(reader({ '.claude/delivery.conf': conf }), { preset: 'frugal', available: { ids, verified: true }, billing: 'api', risky, plannerModel: 'claude-opus-5-5' });
+  assert.deepEqual([frugal.risk.covered, frugal.risk.reviewTier, frugal.planner.model, frugal.planner.tier, frugal.planner.source, frugal.planner.recommended], [false, 'strong', 'claude-opus-5-5', 'strong', 'saved', 'opus']);
+  assert.match(frugal.notes.join('\n'), /no top-tier spend/);
+  const done = await modelPolicy(reader({ '.claude/delivery.conf': applyToConf(conf, p.changes) }), { available: { ids, verified: true } });
+  assert.deepEqual([done.inPolicy, done.diff, done.task, done.problems], [true, '', '', []]);
+  const odd = await modelPolicy(reader({}), { tiers: { cheap: 'sonnet', strong: 'opus', top: 'gpt-9' }, available: { ids, verified: true } });
   assert.equal(odd.initialized, false);
-  assert.match(odd.notes.join('\n'), /"fable" was not found.*same, so the reviewer is not a different model/s);
+  assert.match(odd.notes.join('\n'), /top: "gpt-9" was not found/);
 });

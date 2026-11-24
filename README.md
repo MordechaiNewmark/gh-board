@@ -36,7 +36,15 @@ It works with repos you were **invited to**, because it uses your own GitHub acc
 
 ### Models
 
-The review side is strongest: by default the planner chat uses the strong model (`STRONG_MODEL`, default `opus`; change it in Settings > Claude > Model), and the Repo tab proposes `sonnet` for small implementation tasks and the strong model for reviews and patches, as a diff of `.claude/delivery.conf` you apply through a task and a PR. Details and caveats: docs/PLATFORM.md, "Model allocation".
+The review side is strongest. Three tiers, set in `.env` and overridable per repo: `CHEAP_MODEL` (default `sonnet`), `STRONG_MODEL` (`opus`) and `TOP_MODEL` (`fable`, the strongest and most expensive). The **Repo** tab's Model policy panel offers three presets per repo:
+
+| Preset | Planner | Implement S/M | Implement L | First review | Re-review | Patch |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Balanced** (default, `$$`) | top | cheap | strong | top | strong | strong |
+| Frugal (`$`) | strong | cheap | strong | strong | strong | strong |
+| Max quality (`$$$`) | top | cheap | top | top | top | top |
+
+The panel shows the tier and resolved model id of every role, warns when a reviewer is a lower tier than an implementer, lists tasks labeled `risk:high` or in modules you mark sensitive, and gives you the diff of `.claude/delivery.conf` to apply through a task and a PR (gh-board does not write it). **Test models** sends one tiny prompt per tier, only when you click it, to check that your sign-in can use each model. The planner chat uses the preset's planner tier unless you set Settings > Claude > Planner model. Reasoning, caveats and the plugin gaps: docs/PLATFORM.md, "Model allocation".
 
 ## Setup
 

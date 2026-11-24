@@ -315,3 +315,27 @@ test('setup: runs /delivery-loop:init through the same runner, only after confir
   assert.match(d.argv[d.argv.indexOf('--append-system-prompt') + 1], /open a pull request titled "Set up the delivery loop".*never merge/s);
   assert.deepEqual([st.lastTick.kind, st.lastTick.ok, st.mode], ['init', true, '']);
 });
+
+test('model choice per repo is local; "Test models" runs one tiny no-tool prompt per model, only when confirmed', async () => {
+  const r = await make({ env: { STUB_BAD_MODEL: 'fable' } });
+  assert.deepEqual(r.runner.modelChoice('acme/timesheet'), { preset: 'balanced', tiers: {}, sensitive: [] });
+  assert.deepEqual(r.runner.setModelChoice('acme/timesheet', { preset: 'frugal', tiers: { top: 'claude-fable-5-2', cheap: '' }, sensitive: ['api', 'api', 'bad name!'] }), { preset: 'frugal', tiers: { top: 'claude-fable-5-2' }, sensitive: ['api'] });
+  assert.throws(() => r.runner.setModelChoice('acme/timesheet', { preset: 'yolo' }), /Unknown preset/);
+  assert.throws(() => r.runner.setModelChoice('acme/timesheet', { tiers: { top: 'a b' } }), /does not look like a model name/);
+  assert.equal(r.runner.modelChoice('acme/timesheet').preset, 'frugal', 'a rejected change leaves the choice as it was');
+  assert.equal(JSON.parse(readFileSync(join(r.dir, '.runner.json'), 'utf8')).repos['acme/timesheet'].models.preset, 'frugal');
+
+  await assert.rejects(r.runner.testModels(['opus']), /Confirmation required/);
+  assert.equal(existsSync(join(r.dir, 'dump.json')), false, 'nothing ran without the confirmation');
+  const before = mock.log.length;
+  const { results } = await r.runner.testModels(['opus', 'fable', 'opus'], { confirm: true });
+  assert.deepEqual(results.map((x) => [x.model, x.ok]), [['opus', true], ['fable', false]], 'one run per distinct model; a failing tier is reported, not thrown');
+  assert.match(results[1].error, /issue with the selected model \(fable\)/);
+  const d = r.dump();
+  const opt = (n) => d.argv[d.argv.indexOf(n) + 1];
+  assert.deepEqual([d.argv[1], opt('--model'), opt('--max-turns'), opt('--tools'), opt('--permission-mode')], ['Reply with the single word ok.', 'fable', '1', '', 'dontAsk']);
+  assert.ok(!('GH_TOKEN' in d.env) && !JSON.stringify(d.env).includes(TOK.alice) && !JSON.stringify(d.env).includes(TOK.bob), 'the model test gets no GitHub token at all');
+  assert.equal(d.env.ANTHROPIC_API_KEY, GOOD_KEY);
+  assert.ok(!d.cwd.toLowerCase().includes('.workspaces'), 'it does not run inside a repository');
+  assert.equal(mock.log.length, before, 'and it does not touch GitHub');
+});

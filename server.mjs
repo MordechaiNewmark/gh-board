@@ -16,7 +16,7 @@ import { createLoopApi } from './loop/github.mjs';
 import { lintIssue } from './loop/lint.mjs';
 import { planBacklog, finalBody, finalLabels, epicBodyWithTasks, isEpicDraft, lintDrafts } from './loop/backlog.mjs';
 import { plannerPrompt } from './loop/planner-prompt.mjs';
-import { modelPolicy } from './loop/models.mjs';
+import { modelPolicy, checkTiers, PRESETS, TIERS } from './loop/models.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
@@ -32,9 +32,15 @@ const READ_ONLY = /^(1|true|yes)$/i.test(process.env.READ_ONLY || '');
 const PLANNER = !/^classic$/i.test(process.env.CHAT_MODE || '');
 // Model allocation: the review side is strongest (docs/PLATFORM.md). The planner chat and the loop's reviewers
 // default to the strong model; implementers of small tasks to the cheap one. Aliases the Agent tool accepts.
-const STRONG_MODEL = (process.env.STRONG_MODEL || 'opus').trim();
-const CHEAP_MODEL = (process.env.CHEAP_MODEL || 'sonnet').trim();
-const chatModel = () => claudeAuth.model() || (PLANNER ? STRONG_MODEL : '');
+// Three tiers: cheap < strong < top. A repo can override them and pick a preset in its Model policy panel.
+const ENV_TIERS = checkTiers({ cheap: process.env.CHEAP_MODEL, strong: process.env.STRONG_MODEL, top: process.env.TOP_MODEL });
+const tiersFor = (repo) => { try { return checkTiers({ ...ENV_TIERS, ...(repo ? runner.modelChoice(repo).tiers : {}) }); } catch { return ENV_TIERS; } };
+/** Model of the planner chat: the Settings choice, else the tier the selected repo's preset gives the planner (top by default). */
+const chatModel = (repo) => {
+  if (claudeAuth.model() || !PLANNER) return claudeAuth.model();
+  let preset = 'balanced'; try { if (repo) preset = runner.modelChoice(repo).preset; } catch {}
+  return tiersFor(repo)[PRESETS[preset].planner];
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------- GitHub -------------------------------- */
@@ -598,7 +604,7 @@ async function chat(req, res) {
       prompt: input(),
       options: {
         abortController: abort, env, cwd,
-        model: chatModel() || undefined, // the planner defaults to the strongest model; Settings > Claude > Model overrides it
+        model: chatModel(repoName) || undefined, // the planner defaults to the top model; Settings > Claude > Model overrides it
         resume,
         systemPrompt: systemPrompt(repoName || repo, checkout, actor, loopCtx),
         mcpServers: { gh: makeServer(ctx) },
@@ -692,6 +698,13 @@ async function availableModels() {
   return { ids: claudeAuth.status().models, verified: false };
 }
 
+async function policyFor(repo) {
+  const choice = runner.modelChoice(repo);
+  const snap = await loopApi.snapshot(repo).catch(() => null);
+  const risky = (snap?.cards || []).filter((c) => c.open).map((c) => ({ number: c.number, title: c.title, state: c.state, why: c.labels.some((l) => /^risk:high$/i.test(l.name)) ? 'risk:high' : choice.sensitive.includes(c.module) ? `module:${c.module} is marked sensitive` : '' })).filter((c) => c.why);
+  return modelPolicy((await runner.readerFor(repo)).reader, { tiers: tiersFor(repo), preset: choice.preset, available: await availableModels(), billing: claudeAuth.status().billing, plannerModel: claudeAuth.model(), risky, sensitive: choice.sensitive });
+}
+
 const q = (url, k) => url.searchParams.get(k);
 const routes = {
   'GET /api/auth/status': () => authStatus(),
@@ -736,7 +749,11 @@ const routes = {
   'POST /api/loop/lint': async (u, b) => lintDrafts(Array.isArray(b.drafts) ? b.drafts : [], await loopApi.known(checkRepo(b.repo)).catch(() => ({}))),
   'GET /api/readiness': (u) => runner.readiness(checkRepo(q(u, 'repo'))),
   // Model policy panel: current per-role models from delivery.conf, the recommended preset and the exact diff. Read-only.
-  'GET /api/models/policy': async (u) => modelPolicy((await runner.readerFor(checkRepo(q(u, 'repo')))).reader, { strong: STRONG_MODEL, cheap: CHEAP_MODEL, available: await availableModels(), billing: claudeAuth.status().billing, plannerModel: claudeAuth.model() }),
+  'GET /api/models/policy': (u) => policyFor(checkRepo(q(u, 'repo'))),
+  // Per-repo choice of preset, tier models and sensitive modules. Stored locally (.runner.json); changes nothing on GitHub.
+  'POST /api/models/policy': (u, b) => { const repo = checkRepo(b.repo); runner.setModelChoice(repo, { preset: b.preset, tiers: b.tiers, sensitive: b.sensitive }); return policyFor(repo); },
+  // One tiny prompt per tier model. Only on an explicit click (confirm: true); never automatic.
+  'POST /api/models/test': (u, b) => runner.testModels(TIERS.map((t) => tiersFor(checkRepo(b.repo))[t]), { confirm: b.confirm }),
 
   /* ---- the runner: start / stop delivery ticks ---- */
   'GET /api/runner': (u) => runner.preflight(checkRepo(q(u, 'repo'))),

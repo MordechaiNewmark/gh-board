@@ -25,6 +25,14 @@ const done = (o = {}) => out({ type: 'result', subtype: 'success', is_error: fal
 
 if (mode === 'noplugin') { await sleep(5000); process.exit(0); }
 
+// "Test models": a one-word answer, or the error Claude Code gives for a model the account cannot use.
+if (prompt.startsWith('Reply with the single word ok')) {
+  const model = process.argv[process.argv.indexOf('--model') + 1];
+  if (model === (process.env.STUB_BAD_MODEL || 'no-such-model')) out({ type: 'result', subtype: 'success', is_error: true, result: `There's an issue with the selected model (${model}). It may not exist or you may not have access to it.`, num_turns: 1, total_cost_usd: 0 });
+  else { text('ok'); done({ result: 'ok', num_turns: 1, total_cost_usd: 0.01 }); }
+  process.exit(0);
+}
+
 if (mode === 'hang') {
   // A grandchild that outlives a plain kill of this process: the kill switch has to take the whole tree down.
   const kid = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
