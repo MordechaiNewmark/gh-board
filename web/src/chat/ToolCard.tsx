@@ -12,19 +12,19 @@ export function ToolCard({ toolCallId, toolName, args, result, isError }: Props)
   const hasArgs = !!args && typeof args === "object" && Object.keys(args as object).length > 0;
 
   return (
-    <div className="my-2 rounded-lg border border-input bg-card px-3 py-2.5 text-sm">
+    <div className="my-2 rounded-lg border bg-card px-3 py-2.5 text-sm shadow-xs">
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-xs">{toolName}</span>
         <span className={approval?.state === "rejected" || isError ? "text-xs font-medium text-destructive" : "text-xs text-muted-foreground"}>{state}</span>
       </div>
       {hasArgs && (
-        <pre className="mt-2 max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background px-2.5 py-2 font-mono text-xs text-muted-foreground">
+        <pre className="mt-2 max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted px-2.5 py-2 font-mono text-xs text-muted-foreground">
           {JSON.stringify(args, null, 2)}
         </pre>
       )}
       {approval?.state === "pending" && !done && (
         <div className="mt-2.5 flex gap-2">
-          <Button size="sm" className="bg-brand text-white hover:bg-brand/90" onClick={() => answerApproval(toolCallId, approval, true)}>Approve</Button>
+          <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" onClick={() => answerApproval(toolCallId, approval, true)}>Approve</Button>
           <Button size="sm" variant="outline" onClick={() => answerApproval(toolCallId, approval, false)}>Reject</Button>
         </div>
       )}

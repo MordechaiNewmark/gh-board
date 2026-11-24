@@ -24,5 +24,10 @@ export async function api<T = any>(path: string, body?: unknown): Promise<T> {
 
 export const q = (v: string) => encodeURIComponent(v);
 export const hex = (c?: string) => (/^[0-9a-f]{6}$/i.test(c || "") ? c! : "888888");
-export const labelStyle = (c?: string) => ({ backgroundColor: `#${hex(c)}2e`, borderColor: `#${hex(c)}` });
+/* Tinted chip in the label's own color; the text is pulled toward the foreground so it stays readable in light and dark. */
+export const labelStyle = (c?: string) => ({
+  backgroundColor: `color-mix(in oklab, #${hex(c)} 16%, transparent)`,
+  borderColor: `color-mix(in oklab, #${hex(c)} 45%, transparent)`,
+  color: `color-mix(in oklab, #${hex(c)} 32%, var(--foreground))`,
+});
 export const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
