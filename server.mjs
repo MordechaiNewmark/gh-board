@@ -16,6 +16,7 @@ import { createLoopApi } from './loop/github.mjs';
 import { lintIssue } from './loop/lint.mjs';
 import { planBacklog, finalBody, finalLabels, epicBodyWithTasks, isEpicDraft, lintDrafts } from './loop/backlog.mjs';
 import { plannerPrompt } from './loop/planner-prompt.mjs';
+import { modelPolicy } from './loop/models.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
@@ -29,6 +30,11 @@ const READ_ONLY = /^(1|true|yes)$/i.test(process.env.READ_ONLY || '');
 // Chat mode. "planner" (default): the chat plans WITH the user and produces issues only; it cannot commit files.
 // CHAT_MODE=classic restores the older board-manager chat, which could also commit files.
 const PLANNER = !/^classic$/i.test(process.env.CHAT_MODE || '');
+// Model allocation: the review side is strongest (docs/PLATFORM.md). The planner chat and the loop's reviewers
+// default to the strong model; implementers of small tasks to the cheap one. Aliases the Agent tool accepts.
+const STRONG_MODEL = (process.env.STRONG_MODEL || 'opus').trim();
+const CHEAP_MODEL = (process.env.CHEAP_MODEL || 'sonnet').trim();
+const chatModel = () => claudeAuth.model() || (PLANNER ? STRONG_MODEL : '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------- GitHub -------------------------------- */
@@ -56,7 +62,7 @@ let device = null;
 async function authStatus() {
   const s = await accounts.status();
   const { method, label, source, tail, model, billing } = claudeAuth.status();
-  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, chatMode: PLANNER ? 'planner' : 'classic', claude: { method, label, source, tail, model, billing } };
+  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, chatMode: PLANNER ? 'planner' : 'classic', plannerModel: chatModel(), claude: { method, label, source, tail, model, billing } };
 }
 async function connectToken(token) {
   const added = await accounts.addToken(token, 'token');
@@ -592,7 +598,7 @@ async function chat(req, res) {
       prompt: input(),
       options: {
         abortController: abort, env, cwd,
-        model: claudeAuth.model() || undefined,
+        model: chatModel() || undefined, // the planner defaults to the strongest model; Settings > Claude > Model overrides it
         resume,
         systemPrompt: systemPrompt(repoName || repo, checkout, actor, loopCtx),
         mcpServers: { gh: makeServer(ctx) },
@@ -674,6 +680,18 @@ async function agentPing(env, model) {
   } finally { clearTimeout(timer); }
 }
 
+/** Model ids this credential can use. Only an API key can be asked (free); otherwise the list Claude Code offers, unverified. */
+async function availableModels() {
+  const key = claudeAuth.agentEnv({}).ANTHROPIC_API_KEY;
+  if (key) {
+    try {
+      const r = await fetch(`${String(process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '')}/v1/models?limit=100`, { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' }, signal: AbortSignal.timeout(8000) });
+      if (r.ok) return { ids: ((await r.json()).data || []).map((m) => m.id), verified: true };
+    } catch { /* fall through to the static list */ }
+  }
+  return { ids: claudeAuth.status().models, verified: false };
+}
+
 const q = (url, k) => url.searchParams.get(k);
 const routes = {
   'GET /api/auth/status': () => authStatus(),
@@ -717,6 +735,8 @@ const routes = {
   'POST /api/loop/pr/close': (u, b) => loopApi.close(checkRepo(b.repo), { number: Number(b.number), confirm: b.confirm, reason: b.reason }),
   'POST /api/loop/lint': async (u, b) => lintDrafts(Array.isArray(b.drafts) ? b.drafts : [], await loopApi.known(checkRepo(b.repo)).catch(() => ({}))),
   'GET /api/readiness': (u) => runner.readiness(checkRepo(q(u, 'repo'))),
+  // Model policy panel: current per-role models from delivery.conf, the recommended preset and the exact diff. Read-only.
+  'GET /api/models/policy': async (u) => modelPolicy((await runner.readerFor(checkRepo(q(u, 'repo')))).reader, { strong: STRONG_MODEL, cheap: CHEAP_MODEL, available: await availableModels(), billing: claudeAuth.status().billing, plannerModel: claudeAuth.model() }),
 
   /* ---- the runner: start / stop delivery ticks ---- */
   'GET /api/runner': (u) => runner.preflight(checkRepo(q(u, 'repo'))),

@@ -233,3 +233,32 @@ test('planner prompt: issues only, the plugin conventions, the repo gate and mod
   assert.match(plannerPrompt({ repo: 'a/b', loop: { initialized: false } }), /NOT set up for the delivery loop yet/);
   assert.match(plannerPrompt({ repo: 'a/b', loop: null, readOnly: true }), /READ-ONLY mode/);
 });
+
+test('model policy: review side strongest, mapped onto the keys the plugin already reads; applying is a diff, not a write', async () => {
+  const { modelPolicy, recommended, applyToConf, aliasOf, MODEL_KEYS } = await import('../loop/models.mjs');
+  assert.deepEqual(MODEL_KEYS, ['MODEL_IMPLEMENT_S', 'MODEL_IMPLEMENT_M', 'MODEL_IMPLEMENT_L', 'MODEL_REVIEW', 'MODEL_REREVIEW', 'MODEL_PATCH', 'REREVIEW_SCOPE']);
+  assert.ok(MODEL_KEYS.every((k) => k in parseConf('').values), 'no key the plugin does not have');
+  const rec = recommended({ strong: 'opus', cheap: 'haiku' });
+  assert.deepEqual(MODEL_KEYS.map((k) => rec[k].value), ['haiku', 'haiku', 'opus', 'opus', 'opus', 'opus', 'narrow']);
+  assert.deepEqual(['claude-opus-5-5', 'claude-fable-5-2', 'sonnet', 'gpt-9'].map(aliasOf), ['opus', 'fable', 'sonnet', '']);
+  const conf = `${CONF}MODEL_REVIEW="sonnet"   # first review\nMODEL_PATCH=""\n`;
+  const next = applyToConf(conf, { MODEL_REVIEW: 'opus', MODEL_PATCH: 'opus', MODEL_IMPLEMENT_S: 'sonnet' });
+  assert.match(next, /^MODEL_REVIEW="opus"   # first review$/m);
+  assert.match(next, /# Model allocation: the review side is strongest[^\n]*\nMODEL_IMPLEMENT_S="sonnet"\n$/);
+  assert.equal(parseConf(next).values.GATE_CMD, 'bash scripts/check.sh', 'the rest of the file is untouched');
+  const p = await modelPolicy(reader({ '.claude/delivery.conf': conf }), { strong: 'opus', cheap: 'sonnet', available: { ids: ['claude-opus-5-5', 'claude-sonnet-5-5'], verified: false }, billing: 'subscription' });
+  assert.deepEqual(p.changes, { MODEL_IMPLEMENT_S: 'sonnet', MODEL_IMPLEMENT_M: 'sonnet', MODEL_IMPLEMENT_L: 'opus', MODEL_REVIEW: 'opus', MODEL_REREVIEW: 'opus', MODEL_PATCH: 'opus' });
+  assert.match(p.diff, /^--- a\/\.claude\/delivery\.conf\n\+\+\+ b\/\.claude\/delivery\.conf\n/);
+  assert.match(p.diff, /-MODEL_REVIEW="sonnet"   # first review\n\+MODEL_REVIEW="opus"   # first review/);
+  assert.match(p.diff, /\+MODEL_IMPLEMENT_S="sonnet"/);
+  assert.deepEqual([p.inPolicy, p.planner], [false, { model: 'opus', source: 'default' }]);
+  assert.match(p.notes.join('\n'), /availability was not verified/);
+  assert.match(p.notes.join('\n'), /usage limits/);
+  assert.match(p.notes.join('\n'), /no "escalate after two failed gate runs" rule/);
+  assert.match(p.task, /module:infra task.*MODEL_PATCH="opus"/s);
+  const done = await modelPolicy(reader({ '.claude/delivery.conf': applyToConf(conf, p.changes) }), { available: { ids: ['claude-opus-5-5', 'claude-sonnet-5-5'], verified: true }, billing: 'api' });
+  assert.deepEqual([done.inPolicy, done.diff, done.task], [true, '', '']);
+  const odd = await modelPolicy(reader({}), { strong: 'fable', cheap: 'fable', available: { ids: ['claude-opus-5-5'], verified: true } });
+  assert.equal(odd.initialized, false);
+  assert.match(odd.notes.join('\n'), /"fable" was not found.*same, so the reviewer is not a different model/s);
+});

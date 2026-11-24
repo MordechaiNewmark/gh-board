@@ -105,7 +105,7 @@ export function loopWorld({ gate = true, conf = true } = {}) {
     [SHA[23]]: [run('gate', 'failure'), run('build', 'success')],
     [SHA[24]]: [run('gate', 'failure')],
   };
-  const f = (filename, additions, deletions, status = 'modified') => ({ filename, additions, deletions, status });
+  const f = (filename, additions, deletions, status = 'modified') => ({ filename, additions, deletions, status, patch: "@@ -1,4 +1,6 @@\n import { rows } from './index';\n-export const sep = ';';\n+export const sep = ',';\n+export const quote = (v) => (/[\",]/.test(v) ? JSON.stringify(v) : v);\n" });
   const files = {
     21: [f('src/export/csv.ts', 148, 0, 'added'), f('src/export/index.ts', 12, 4), f('src/routes.ts', 6, 1), f('test/export/csv.test.ts', 44, 0, 'added'), f('docs/export_spec.md', 2, 4)],
     22: [f('web/src/Timesheet.tsx', 31, 3), f('web/src/ExportButton.tsx', 22, 0, 'added'), f('web/test/export-button.test.tsx', 11, 0, 'added')],

@@ -167,7 +167,7 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
     const { acct, ws, conf } = await prepare(repo, kind);
     const bin = resolveClaude({ env });
     const autonomy = kind === 'tick' ? c.autonomy : 'supervised';
-    const args = buildArgs({ kind, autonomy, parallel: c.parallel, conf, maxTurns: lim.maxTurns, model: env.RUNNER_MODEL || claudeAuth.model() || '', budgetUsd: lim.budgetUsd, extraAllow });
+    const args = buildArgs({ kind, autonomy, parallel: c.parallel, conf, maxTurns: lim.maxTurns, model: env.RUNNER_MODEL || '', budgetUsd: lim.budgetUsd, extraAllow });
     const childEnv = buildEnv({ base: env, token: acct.token, claudeEnv: claudeAuth.agentEnv({}), pass: envPass, apiHost });
     const scrub = makeScrubber([acct.token, childEnv.ANTHROPIC_API_KEY, childEnv.CLAUDE_CODE_OAUTH_TOKEN], (x) => claudeAuth.scrub(accounts.scrub(x)));
 
@@ -354,5 +354,5 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
   const anyActive = () => [...live.values()].some(active);
   process.once('exit', () => { for (const s of live.values()) killTree(s.child); });
 
-  return { start, stop, stopAll, pause, resume, setup, setAutonomy, status, preflight, readiness: repoReadiness, modulesOf, history, log, anyActive, workspaces, limits: lim };
+  return { start, stop, stopAll, pause, resume, setup, setAutonomy, status, preflight, readiness: repoReadiness, readerFor, modulesOf, history, log, anyActive, workspaces, limits: lim };
 }

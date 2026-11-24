@@ -122,11 +122,11 @@ export function SettingsDialog({ open, onOpenChange, onChanged }: Props) {
           )}
 
           <div className="flex flex-col gap-2">
-            <Label htmlFor="claude-model">Model</Label>
+            <Label htmlFor="claude-model">Planner model</Label>
             <Input id="claude-model" name="claude-model" list="claude-models" autoComplete="off" spellCheck={false} placeholder="Default for your account" className="font-mono text-[13px] md:text-[13px]"
               value={model} onChange={(e) => setModel(e.target.value)} />
             <datalist id="claude-models">{(cfg?.models ?? []).map((m) => <option key={m} value={m} />)}</datalist>
-            <p className="text-xs text-muted-foreground">Leave empty for the default, or pick or type a model ID.{cfg?.modelSource === "env" && " Currently set by CLAUDE_MODEL in .env."}</p>
+            <p className="text-xs text-muted-foreground">The model the planner chat thinks with. Leave empty for the strongest (the review side and planning get the strong model; the loop sets its own per role in each repo, see the Repo tab), or pick or type a model ID.{cfg?.modelSource === "env" && " Currently set by CLAUDE_MODEL in .env."}</p>
           </div>
 
           {cfg?.ambientApiKeyIgnored && <p className="text-xs text-muted-foreground">An <code className="rounded bg-secondary px-1 font-mono text-foreground">ANTHROPIC_API_KEY</code> is set in the shell that started gh-board. It is not used unless you save a key here or put it in .env.</p>}

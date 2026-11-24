@@ -86,7 +86,7 @@ export function createLoopApi({ forRepo, getModules = async () => [], cacheMs = 
         issue, pr: p, loopState: p.labels.some((l) => l.toLowerCase() === 'needs-human') ? 'needs-human' : state,
         reviews: reviews.map((r) => ({ id: r.id, by: r.user?.login || '', state: r.state, body: r.body || '', at: r.submitted_at, commit: r.commit_id || '' })),
         comments: comments.map(normComment), runs: (checks.check_runs || []).map(normRun),
-        files: files.map((f) => ({ filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions })),
+        files: files.map((f) => ({ filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, patch: typeof f.patch === "string" ? f.patch.slice(0, 12000) : "" })),
       }),
       deps: issue ? parseDeps(issue.body) : [],
     };
