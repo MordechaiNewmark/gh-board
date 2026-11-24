@@ -43,6 +43,8 @@ export const chatCtx = {
   repo: "",
   autoApprove: false,
   sessionId: null as string | null,
+  provider: "claude", // set by the provider picker (settings/providers.ts)
+  model: "",
   chatId: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2),
   onDone: () => {},
 };
@@ -100,7 +102,7 @@ const adapter: ChatModelAdapter = {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, files, repo: chatCtx.repo, sessionId: chatCtx.sessionId, autoApprove: chatCtx.autoApprove, chatId: chatCtx.chatId }),
+      body: JSON.stringify({ message, files, repo: chatCtx.repo, sessionId: chatCtx.sessionId, autoApprove: chatCtx.autoApprove, chatId: chatCtx.chatId, provider: chatCtx.provider, model: chatCtx.model }),
       signal: abortSignal,
     });
     if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -132,6 +134,11 @@ const adapter: ChatModelAdapter = {
           try { ev = JSON.parse(line); } catch { continue; }
           if (ev.type === "session") chatCtx.sessionId = ev.sessionId;
           else if (ev.type === "text") { addText(ev.text); changed = true; }
+          else if (ev.type === "delta") { // streamed text from non-Claude providers: append as-is
+            const tail = parts[parts.length - 1];
+            if (tail?.type === "text") tail.text += ev.text; else parts.push({ type: "text", text: String(ev.text ?? "") });
+            changed = true;
+          }
           else if (ev.type === "tool") {
             parts.push({ type: "tool-call", toolCallId: ev.id || `tool-${++n}`, toolName: ev.name, args: ev.input ?? {}, argsText: JSON.stringify(ev.input ?? {}) });
             changed = true;

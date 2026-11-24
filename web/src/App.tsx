@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type HTMLAttributes } from "react";
-import { CircleAlertIcon, FolderGit2Icon, KanbanIcon, LockIcon, PlusIcon, RefreshCwIcon, SearchIcon, SparklesIcon, XIcon } from "lucide-react";
+import { CircleAlertIcon, FolderGit2Icon, KanbanIcon, LockIcon, PlusIcon, RefreshCwIcon, SearchIcon, SettingsIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -13,10 +13,12 @@ import { api, errMsg, q, type Auth, type BoardData, type Label, type Meta, type 
 import { AuthDialog } from "./AuthDialog";
 import { IssueDialog, type IssueTarget } from "./IssueDialog";
 import { AnalyzeButton, ChatWelcome } from "./chat/Analyze";
+import { ProviderNotice, ProviderPicker } from "./chat/ProviderPicker";
 import { ChatRuntimeProvider, chatCtx, setChatRepo } from "./chat/runtime";
 import { Thread } from "./chat/thread";
 import { ToolCard } from "./chat/ToolCard";
 import { ToolGroup } from "./chat/ToolGroup";
+import { SettingsDialog } from "./settings/SettingsDialog";
 import { Board, BoardSkeleton } from "./views/Board";
 import { Code } from "./views/Code";
 import { Hierarchy, HierarchySkeleton } from "./views/Hierarchy";
@@ -58,6 +60,7 @@ export default function App() {
   const [auth, setAuth] = useState<Auth>({ connected: false });
   const [booted, setBooted] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [reposLoading, setReposLoading] = useState(false);
   const [repoQuery, setRepoQuery] = useState("");
@@ -210,6 +213,7 @@ export default function App() {
               ? <><UserAvatar login={auth.login} src={auth.avatar} size={22} className="ring-0" /><span className="text-[13px]">{auth.login}</span></>
               : <><GithubIcon />Connect GitHub</>}
           </Button>
+          <Button variant="ghost" size="icon-sm" aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}><SettingsIcon /></Button>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
@@ -293,18 +297,20 @@ export default function App() {
           <Splitter {...chatPane.handleProps} />
           <aside id="chat" aria-label="Claude chat" className={cn("min-h-0 flex-1 flex-col bg-background md:flex md:w-[min(var(--chat-w),45vw)] md:flex-none", chat ? "flex" : "hidden")}>
             <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-4 py-2">
-              <span className="mr-auto flex items-center gap-2 text-[14px] font-semibold"><SparklesIcon aria-hidden className="size-4 text-brand" />Ask Claude</span>
+              <ProviderPicker onOpenSettings={() => setSettingsOpen(true)} />
               <AnalyzeButton />
               <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
                 <Checkbox checked={autoApprove} onCheckedChange={(v) => setAutoApprove(v === true)} /> Auto-approve writes
               </label>
             </div>
+            <ProviderNotice onOpenSettings={() => setSettingsOpen(true)} />
             <div className="min-h-0 flex-1"><Thread components={THREAD_COMPONENTS} /></div>
           </aside>
         </div>
       </div>
 
       <AuthDialog open={authOpen} auth={auth} onOpenChange={setAuthOpen} onChanged={() => void boot()} />
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {target && (
         <IssueDialog
           key={`${target.number ?? "new"}-${target.parent ?? ""}-${target.column ?? ""}`}

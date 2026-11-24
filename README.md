@@ -73,6 +73,41 @@ Every issue body follows one template: Context (with `path:line` references and 
 - `READ_ONLY=1` in `.env` blocks every write to GitHub in the server itself (board UI and chat). Use it to try an analysis with no chance of creating anything; the proposal still appears in the chat.
 - Limits: repos over `ANALYSIS_MAX_MB` (default 300, as reported by GitHub) are refused, and a sync is killed after `ANALYSIS_SYNC_TIMEOUT_S` (default 180).
 
+## Providers
+
+The chat runs on Claude by default (the Claude Agent SDK path described above, unchanged). It can also run on other models. Pick the provider and model in the chat header; the choice is remembered in your browser. Set providers up under the gear icon, **Settings > Providers**.
+
+| Provider | Kind | Key | Notes |
+| --- | --- | --- | --- |
+| Claude | Claude Agent SDK | Your Claude sign-in | Default. The most reliable at long, multi-step analysis. |
+| OpenAI | Chat Completions API | `OPENAI_API_KEY` or the UI | |
+| Google Gemini | `generateContent` API | `GEMINI_API_KEY` / `GOOGLE_API_KEY` or the UI | |
+| Custom (any number) | OpenAI-compatible | Optional | OpenRouter, Groq, Mistral, Ollama, LM Studio and anything else that speaks `/v1/chat/completions`. Give it a name, a base URL and model ids. |
+
+For each provider you can paste a key, edit the model list (ids are free text; **Test connection** also loads the ids the provider offers), change the base URL, turn it off, and remove it. **Test connection** lists the provider's models, which spends no tokens; for a custom endpoint it also sends a one-token request, because some of them list models without checking the key.
+
+**What every provider gets.** The same GitHub tools (one list of definitions in `server.mjs` feeds both paths), the same system prompt and issue template, and read-only access to the local checkout through `read_file_local`, `glob` and `grep`, which stand in for Claude Code's `Read` / `Glob` / `Grep` and go through the same path guard: nothing outside the checkout, no `.git`, no `node_modules`, no binaries, nothing over `ANALYSIS_MAX_FILE_MB`, symlinks resolved. There is still no shell and no writing to disk. Every write to GitHub shows the same Approve / Reject card, "Auto-approve writes" works the same way, and `READ_ONLY=1` blocks writes on every path.
+
+**Where keys live**
+
+- Keys saved in the UI go to `.providers.json` next to the server: git-ignored, created with owner-only permissions (`0600`), written atomically. On Windows the file relies on your user profile's permissions, like `.gh-token`.
+- Keys in `.env` work as a fallback when nothing is saved in the UI: `OPENAI_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, and for a custom provider any variable ending in `_API_KEY` that you name when adding it (for example `GROQ_API_KEY`). `OPENAI_BASE_URL` / `GEMINI_BASE_URL` override the endpoints.
+- A key is never sent to the browser. The UI shows where it came from and at most its last four characters. Keys are not logged, are scrubbed from error messages, and are removed from the server's environment at startup, so `git`, `gh` and the Claude Code process never inherit them.
+- A key is sent only to its own provider's base URL, in a header, and redirects are refused. Base URLs must be `http://` or `https://`; a plain-http address that is not this computer gets a warning, because the key and the repo content would travel unencrypted.
+
+**Limits**, all optional in `.env`: `PROVIDER_MAX_STEPS` (model turns per message, default 60), `PROVIDER_TIMEOUT_S` (default 1200, not counting time spent waiting for your approval), `PROVIDER_TOOL_OUTPUT_CHARS` (cap on one tool result, default 30000) and `PROVIDER_HISTORY_CHARS` (cap on tool output kept in a conversation, default 300000; the oldest results are dropped first).
+
+**Know before you switch**
+
+- Models other than Claude are often weaker at long tool-using work. A whole-repo audit can stop early, skip steps, repeat itself or cite less carefully. Check the findings before approving a backlog. Small local models are the weakest here.
+- The model must support tool (function) calling. If it does not, the chat says so and names the model.
+- With a non-Claude provider, your prompts, issue text and every repo file the model reads are sent to that provider. Use a local server (Ollama, LM Studio) if the code must not leave your machine.
+- Conversation history for these providers is kept in the server's memory per chat and is lost on restart. Switching between Claude and another provider, or switching repos, starts a fresh conversation.
+- Wrong key, rate limit, quota, unknown model and unreachable server each produce a message that names the provider.
+- Not supported on these providers: extended thinking output, prompt caching controls, and resuming a session after a server restart.
+
+`npm test` runs the provider tests against a scripted mock model (no network, no keys). `node test/e2e-providers.mjs` runs a full chat against a `READ_ONLY=1` server and your GitHub read access.
+
 ## On a phone
 
 The layout adapts below 760 px: repos become a scrolling strip, columns swipe sideways, and Chat is its own tab. Touch has no drag and drop, so tap a card and change **Column** in the dialog.
@@ -83,4 +118,5 @@ The server is on your computer, so the phone has to reach it. In `.env` set `HOS
 
 - The server only listens on 127.0.0.1 and rejects requests from other sites.
 - The agent has the GitHub tools in `server.mjs` plus read-only `Read` / `Glob` / `Grep` confined to `.repo-cache/<owner>/<name>` of the selected repo: no shell, no writes to disk, and no access to the rest of your disk.
+- Other providers (OpenAI, Gemini, OpenAI-compatible) get the same tools and limits; see Providers.
 - Shows up to about 300 open and 40 recently closed issues per repo. Files over 1 MB can't be read through the API.

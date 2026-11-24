@@ -8,7 +8,8 @@
     "start": "node server.mjs",
     "setup": "npm install && npm --prefix web run setup",
     "build": "npm --prefix web run build",
-    "dev:web": "npm --prefix web run dev"
+    "dev:web": "npm --prefix web run dev",
+    "test": "node --test test/providers.test.mjs"
   },
   "engines": {
     "node": ">=20.12"
