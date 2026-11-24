@@ -1,6 +1,42 @@
 # gh-board
 
-A local board for GitHub issues with a Claude Agent SDK chat that manages it. Works with repos you were **invited to**, because it uses your own GitHub accounts rather than Claude Desktop's GitHub connection. You can connect several GitHub identities at once (personal, work, a client's org) and use all of them in one board.
+**Issues are the product.** gh-board is the front end of an autonomous development loop: you think, plan and design in a chat and on a board, and what comes out is GitHub issues (epics, tasks, specs). Agents then do the development work on their own, running the [delivery-loop](https://github.com/MordechaiNewmark/delivery-loop/tree/cost-aware-defaults) plugin for Claude Code, and you supervise: you read evidence, merge, and answer escalations. The chat never edits code.
+
+- **Planner chat.** Plans with you, reads the repo, and creates issues the loop can run: one module, size S or M, `Depends-on`, acceptance criteria that are commands. Every write shows a preview you approve. Works with Claude, OpenAI, Gemini and OpenAI-compatible models.
+- **Run control.** Start one tick or run continuously, pause, stop. Each tick is one Claude Code session running the plugin's own `/delivery-loop:delivery-tick` in a working clone on this machine.
+- **Loop board.** The plugin's real states (blocked, ready, claimed, in review, changes requested, approved, needs human, done), with the PR, CI, patch round and blockers on each card. The classic `status:<Column>` board is one click away.
+- **Inbox.** What needs you: escalations, approved PRs to merge, failing checks, stale claims. Review is evidence first: per-criterion results, gate and CI, attached screenshots and video, findings; the diff comes last.
+- **Repo tab.** Whether the repo is ready (gate, styleguides, specs, rules) as a trust pyramid, and the model policy.
+
+It works with repos you were **invited to**, because it uses your own GitHub accounts, and you can connect several identities at once. The design, the safety model and the roadmap are in [docs/PLATFORM.md](docs/PLATFORM.md).
+
+## Quick start: planner and loop
+
+1. Set up and start gh-board (next section), connect GitHub, pick a repository.
+2. Install the engine yourself, once (gh-board checks for it and never installs anything):
+   ```bash
+   claude plugin marketplace add "MordechaiNewmark/delivery-loop#cost-aware-defaults"
+   claude plugin install delivery-loop@delivery-loop
+   ```
+   The loop also needs `git`, `gh`, `jq` and `bash` on PATH.
+3. Open the **Repo** tab. If the repo is not set up, click **Set up this repo**: after a confirmation it runs `/delivery-loop:init`, which creates the loop's labels and opens a pull request with `.claude/delivery.conf` and a starter gate (`scripts/check.sh`). Review the gate and merge that PR yourself. **The loop refuses to run without a gate that checks something.**
+4. Plan in the chat: "Plan a feature into loop-ready tasks". Approve the preview card. Cards on the Loop board show whether each task is ready for the loop.
+5. On the **Board**, click **Run one tick**, read the confirmation, start. Watch the tick in the Run panel. When a PR is approved it appears in the **Inbox**; review the evidence and merge.
+6. When single ticks are boringly reliable, use **Run continuously**. Autonomy stays at **Supervised** (you merge every PR) until you raise it.
+
+### Safety notes (read before the first run)
+
+- **Agents run on your machine as you.** The session gets an allowlist (git, gh, jq, the repo's gate and setup command, the plugin's scripts; edits inside the workspace only), no network tools, no MCP servers, and it cannot run `gh pr merge` unless you chose Auto-merge. That is a seatbelt, not a sandbox: the gate executes the repository's code. Run the loop only on repos, and with issue authors, you trust.
+- **Use a fine-grained GitHub token limited to the repo** (contents, issues, pull requests: read and write) for the account that owns it. The session receives only that account's token, never the other accounts', never provider keys. gh-board warns when the token is a broad classic PAT or OAuth token.
+- **Protect the base branch** on GitHub (required checks or review). On a single account that is what makes "the human merges" true; a separate bot account for the agents is better still.
+- **Issues, PR text and repo files are untrusted input** to the agents. The gate and your merge are the controls.
+- **Limits**: 40 ticks per repo per day, 60 minutes and 200 turns per tick, one run per repo, stop on the first failed tick. **Stop** kills the session and everything it started. `READ_ONLY=1` disables the runner and every write.
+- Every tick is logged, with tokens scrubbed, in `.runs/`. Denied actions are listed in the Run panel.
+- Not yet proven by a real end-to-end run from gh-board: see "What is not verified" in docs/PLATFORM.md. Start with one supervised tick.
+
+### Models
+
+The review side is strongest: by default the planner chat uses the strong model (`STRONG_MODEL`, default `opus`; change it in Settings > Claude > Model), and the Repo tab proposes `sonnet` for small implementation tasks and the strong model for reviews and patches, as a diff of `.claude/delivery.conf` you apply through a task and a PR. Details and caveats: docs/PLATFORM.md, "Model allocation".
 
 ## Setup
 
@@ -55,6 +91,8 @@ The account button in the header opens the account manager. **Add account** conn
 **Upgrading from the single-account version.** Nothing to do. On first start, an existing `.gh-token` is checked with GitHub, moved into `.gh-accounts.json` as your default account, and deleted. If GitHub rejects it, the file is left alone and the dialog tells you. If you were using `GITHUB_TOKEN` or the GitHub CLI, that keeps working as before.
 
 ## What you can do
+
+_The chat is in planner mode by default: it has no tool that commits files. `CHAT_MODE=classic` restores the older chat described in the "Through chat" column, including commits._
 
 | Area | In the UI | Through chat |
 | --- | --- | --- |
