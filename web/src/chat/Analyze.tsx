@@ -6,8 +6,16 @@ import { useChatRepo } from "./runtime";
 /* Starting points for a whole-repo analysis. The title is what the user sees; the prompt is what Claude gets. */
 export const ANALYSES = [
   {
+    title: "Plan a feature into loop-ready tasks",
+    prompt: "I want to plan a feature. Ask me what it should do and what done means, read the code and specs it touches, then propose an epic with tasks the delivery loop can run (module, size, depends-on, executable acceptance criteria) and submit them with create_issues for my approval.",
+  },
+  {
     title: "Audit this repo and propose a backlog",
-    prompt: "Audit this repo end to end: sync it, survey the structure, architecture, README/specs, tests, config and CI, and look for bugs, risks and gaps. Summarize your findings with path:line evidence, then propose a backlog of epics and child issues and submit it with create_issues for my approval.",
+    prompt: "Audit this repo end to end: sync it, survey the structure, architecture, README/specs, tests, config and CI, and look for bugs, risks and gaps. Summarize your findings with path:line evidence, then propose a backlog of epics and loop-ready tasks and submit it with create_issues for my approval.",
+  },
+  {
+    title: "Check which issues are ready for the loop",
+    prompt: "Run check_issues on this repo and tell me which open issues the delivery loop cannot run yet and why. Propose the fixes (acceptance criteria as commands, size, module, dependencies) and apply them with update_issue after I approve.",
   },
   {
     title: "Find TODOs and turn them into issues",
@@ -16,10 +24,6 @@ export const ANALYSES = [
   {
     title: "Compare README/specs to the code and file gaps",
     prompt: "Sync the repo, read the README and any docs/specs, and compare what they promise with what the code actually does. List each gap (documented but missing, implemented but undocumented, or contradicting) with evidence from both sides, then propose issues for the gaps via create_issues for my approval.",
-  },
-  {
-    title: "Review test coverage gaps",
-    prompt: "Sync the repo and map the tests to the code: which modules and critical paths have tests, which have none, and which tests are skipped or shallow. Summarize the riskiest untested areas with path:line references and propose focused testing issues via create_issues for my approval.",
   },
 ];
 
@@ -34,7 +38,7 @@ function useAnalyze() {
 export function AnalyzeButton() {
   const { repo, disabled, run } = useAnalyze();
   return (
-    <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs" disabled={disabled} onClick={() => run(ANALYSES[0].prompt)}
+    <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs" disabled={disabled} onClick={() => run(ANALYSES[1].prompt)}
       title={repo ? `Explore all of ${repo} and propose a backlog of issues` : "Pick a repository first"}>
       <ScanSearchIcon aria-hidden className="size-3.5" />Analyze repo
     </Button>
@@ -46,13 +50,13 @@ export function ChatWelcome() {
   const { repo, disabled, run } = useAnalyze();
   return (
     <div className="mb-5 flex flex-col px-2">
-      <p className="fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-medium tracking-tight duration-200">How can I help you today?</p>
+      <p className="fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-medium tracking-tight duration-200">What should we build?</p>
       <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">
         {repo
-          ? <>I can manage the board, or read all of <span className="font-mono text-foreground/80">{repo}</span> and turn what I find into issues you approve.</>
-          : "Pick a repository to manage its board or analyze its code."}
+          ? <>Think it through with me. I read all of <span className="font-mono text-foreground/80">{repo}</span> and turn the plan into issues you approve; the delivery loop builds them.</>
+          : "Pick a repository to plan its backlog."}
       </p>
-      <ul aria-label="Analysis starting points" className="mt-4 flex flex-col">
+      <ul aria-label="Starting points" className="mt-4 flex flex-col">
         {ANALYSES.map((a) => (
           <li key={a.title}>
             <button type="button" disabled={disabled} onClick={() => run(a.prompt)}

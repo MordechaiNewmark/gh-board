@@ -24,7 +24,7 @@ export type ClaudeSettings = ClaudeBrief & {
 export type Auth = {
   connected: boolean; login?: string; avatar?: string; source?: string; deviceFlow?: boolean;
   device?: { status: string; error?: string; login?: string } | null; error?: string; readOnly?: boolean;
-  accounts?: Account[]; hidden?: HiddenAccount[]; notices?: string[]; claude?: ClaudeBrief;
+  accounts?: Account[]; hidden?: HiddenAccount[]; notices?: string[]; claude?: ClaudeBrief; chatMode?: "planner" | "classic"; plannerModel?: string;
 };
 /** Which account a repo's reads and writes go through (this decides attribution on GitHub). */
 export type RepoAccount = { repo: string; login: string; avatar: string; role: string; overridden: boolean; candidates: RepoAccess[] };

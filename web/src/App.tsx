@@ -20,11 +20,18 @@ import { ChatRuntimeProvider, chatCtx, setChatRepo } from "./chat/runtime";
 import { Thread } from "./chat/thread";
 import { ToolCard } from "./chat/ToolCard";
 import { ToolGroup } from "./chat/ToolGroup";
+import { useLoop } from "@/lib/loop";
+import { Notice } from "./loop/bits";
+import { RunPanel } from "./loop/RunPanel";
 import { Board, BoardSkeleton } from "./views/Board";
+import { Inbox } from "./views/Inbox";
+import { LoopBoard } from "./views/LoopBoard";
+import { RepoReadiness } from "./views/RepoReadiness";
 import { Code } from "./views/Code";
 import { Hierarchy, HierarchySkeleton } from "./views/Hierarchy";
 
-type View = "board" | "tree" | "code" | "chat";
+type View = "board" | "tree" | "code" | "inbox" | "repo" | "chat";
+type BoardMode = "auto" | "loop" | "classic";
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 const THREAD_COMPONENTS = { ToolFallback: ToolCard, ToolGroup, Welcome: ChatWelcome };
 const EMPTY: BoardData = { columns: [], prefix: "status:", issues: [] };
@@ -79,6 +86,9 @@ export default function App() {
   const [filter, setFilter] = useState("");
   const [target, setTarget] = useState<IssueTarget | null>(null);
   const [autoApprove, setAutoApprove] = useState(false);
+  const [boardMode, setBoardMode] = useState<BoardMode>(() => (stored("gh-board:board-mode") as BoardMode) || "auto");
+  const [inboxSel, setInboxSel] = useState("");
+  const loop = useLoop(repo, !!auth.connected);
   const { toasts, push: toast, dismiss } = useToasts();
   const filterRef = useRef<HTMLInputElement>(null);
   const latestLoad = useRef(0);
@@ -141,9 +151,14 @@ export default function App() {
   useEffect(() => { if (acctFilter && !accounts.some((a) => a.login === acctFilter)) setAcctFilter(""); }, [accounts, acctFilter]);
 
   // Keep the chat in sync with what the board is showing.
-  useEffect(() => { setChatRepo(repo); chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => void load(repo); }, [repo, autoApprove, load]);
+  useEffect(() => { setChatRepo(repo); chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => { void load(repo); void loop.reloadData(true); }; }, [repo, autoApprove, load, loop.reloadData]);
 
-  const pickRepo = (name: string) => { store("repo", name); setRepo(name); setFilter(""); void load(name); };
+  const pickRepo = (name: string) => { store("repo", name); setRepo(name); setFilter(""); setInboxSel(""); void load(name); };
+  // The Loop board is the default wherever the delivery loop has tasks; the classic status:<Column> board stays one click away.
+  const loopMode = boardMode === "loop" || (boardMode === "auto" && (loop.data?.cards.length ?? 0) > 0);
+  const pickBoard = (m: "loop" | "classic") => { store("gh-board:board-mode", m); setBoardMode(m); };
+  const review = (pr: number) => { setInboxSel(`pr-${pr}`); setView("inbox"); };
+  const refresh = () => { void load(repo); void loop.refresh(); };
   const newIssue = useCallback((extra: Partial<IssueTarget> = {}) => {
     if (repo) setTarget({ number: null, ...extra });
     else toast("Pick a repository first.", "error");
@@ -167,14 +182,16 @@ export default function App() {
       if (document.querySelector('[role="dialog"]')) return;
       if (e.key === "/") { e.preventDefault(); setView((v) => (v === "tree" ? v : "board")); requestAnimationFrame(() => { filterRef.current?.focus(); filterRef.current?.select(); }); }
       else if (e.key === "n") { e.preventDefault(); newIssue(); }
-      else if (e.key === "r") { e.preventDefault(); void load(repo); }
+      else if (e.key === "r") { e.preventDefault(); void load(repo); void loop.refresh(); }
       else if (e.key === "1") setView("board");
       else if (e.key === "2") setView("tree");
       else if (e.key === "3") setView("code");
+      else if (e.key === "4") setView("inbox");
+      else if (e.key === "5") setView("repo");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [newIssue, load, repo]);
+  }, [newIssue, load, repo, loop.refresh]);
 
   const current = loadedRepo === repo ? data : EMPTY;
   const shown = useMemo(() => {
@@ -212,12 +229,24 @@ export default function App() {
       </EmptyState>
     );
     if (!repo) return <EmptyState icon={<FolderGit2Icon />} title="Pick a repository">Choose one from the list, or type <span className="font-mono">owner/name</span> in the search box and press Enter.</EmptyState>;
+    if (view === "repo") return <RepoReadiness repo={repo} loop={loop} onAsk={askChat} onOpenSettings={() => setSettingsOpen(true)} onToast={toast} />;
+    if (view === "inbox") {
+      if (!loop.data) return loop.error ? <EmptyState icon={<CircleAlertIcon />} title="Could not load the inbox" action={<Button variant="outline" onClick={refresh}><RefreshCwIcon />Try again</Button>}>{loop.error}</EmptyState> : <HierarchySkeleton />;
+      return <Inbox repo={repo} data={loop.data} readOnly={auth.readOnly} selected={inboxSel} onSelect={setInboxSel} onOpenIssue={(n) => setTarget({ number: n })} onDone={(m) => { toast(m); refresh(); }} />;
+    }
     if (view === "code") return <Code repo={repo} onNewIssue={(f) => setTarget({ number: null, title: `Change in ${f.path}`, body: `File: \`${f.path}\`\n${f.url}\n\n` })} onAsk={(f) => askChat(`Read ${f.path} and `)} />;
     if (loadError && loadedRepo !== repo) return (
       <EmptyState icon={<CircleAlertIcon />} title={`Could not load ${repo}`} action={<Button variant="outline" onClick={() => void load(repo)}><RefreshCwIcon />Try again</Button>}>{loadError}</EmptyState>
     );
     if (firstLoad) return view === "tree" ? <HierarchySkeleton /> : <BoardSkeleton columns={data.columns} />;
     if (view === "tree") return <Hierarchy prefix={current.prefix} issues={shown} filtered={filtered} onOpen={(n) => setTarget({ number: n })} onAddSub={(p) => setTarget({ number: null, parent: p })} />;
+    if (loopMode) return (
+      <div className="flex h-full min-h-0 flex-col">
+        <RunPanel repo={repo} loop={loop} onToast={toast} />
+        {loop.error && !loop.data && <div className="px-3 md:px-5"><Notice kind="bad">Could not load the loop state: {loop.error}</Notice></div>}
+        <div className="min-h-0 flex-1">{loop.data ? <LoopBoard data={loop.data} filter={filter} onOpen={(n) => setTarget({ number: n })} onReview={review} onAsk={askChat} /> : !loop.error && <BoardSkeleton columns={["Blocked", "Ready", "Claimed", "In review", "Approved"]} />}</div>
+      </div>
+    );
     return <Board columns={current.columns} prefix={current.prefix} issues={shown} filtered={filtered} onOpen={(n) => setTarget({ number: n })} onMove={move} onNew={(column) => newIssue({ column })} />;
   };
 
@@ -231,10 +260,12 @@ export default function App() {
           </div>
           <Tabs value={view} onValueChange={(v) => setView(v as View)} className="order-2 w-full md:order-none md:w-auto">
             <TabsList className="h-8 w-full md:w-auto">
-              <TabsTrigger value="board" className="px-3 text-[13px]">Board</TabsTrigger>
-              <TabsTrigger value="tree" className="px-3 text-[13px]">Hierarchy</TabsTrigger>
-              <TabsTrigger value="code" className="px-3 text-[13px]">Code</TabsTrigger>
-              <TabsTrigger value="chat" className="px-3 text-[13px] md:hidden">Chat</TabsTrigger>
+              <TabsTrigger value="board" className="px-2 text-[13px] sm:px-3">Board</TabsTrigger>
+              <TabsTrigger value="tree" className="px-2 text-[13px] sm:px-3">Hierarchy</TabsTrigger>
+              <TabsTrigger value="code" className="px-2 text-[13px] sm:px-3">Code</TabsTrigger>
+              <TabsTrigger value="inbox" className="gap-1.5 px-2 text-[13px] sm:px-3">Inbox{(loop.data?.inbox.length ?? 0) > 0 && <span className="rounded-full bg-brand px-1.5 text-[10.5px] font-semibold leading-4 text-brand-foreground tabular-nums">{loop.data!.inbox.length}</span>}</TabsTrigger>
+              <TabsTrigger value="repo" className="px-2 text-[13px] sm:px-3">Repo</TabsTrigger>
+              <TabsTrigger value="chat" className="px-2 text-[13px] sm:px-3 md:hidden">Chat</TabsTrigger>
             </TabsList>
           </Tabs>
           <div className="ml-auto flex items-center gap-1">
@@ -315,11 +346,21 @@ export default function App() {
                 <h1 className="truncate text-[15px] font-semibold tracking-[-0.01em]">
                   {repo ? <>{owner && <span className="hidden font-normal text-muted-foreground sm:inline">{owner} / </span>}{name}</> : "No repository"}
                 </h1>
-                {repo && loadedRepo === repo && view !== "code" && (
+                {repo && loadedRepo === repo && (view === "board" || view === "tree") && (
                   <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{filtered ? `${shown.length} of ${current.issues.length}` : current.issues.length} issue{current.issues.length === 1 ? "" : "s"}</span>
                 )}
               </div>
-              {view !== "code" && (
+              {view === "board" && repo && (
+                <div role="group" aria-label="Board type" className="flex h-8 items-center rounded-md border bg-muted p-0.5 text-[12.5px]">
+                  {(["loop", "classic"] as const).map((m) => (
+                    <button key={m} type="button" aria-pressed={(m === "loop") === loopMode} onClick={() => pickBoard(m)} title={m === "loop" ? "The delivery loop's own states. The loop moves the cards." : "Your status:<Column> board. You move the cards."}
+                      className={cn("h-full rounded px-2.5 font-medium transition-colors", (m === "loop") === loopMode ? "bg-background text-foreground shadow-xs" : "text-muted-foreground hover:text-foreground")}>
+                      {m === "loop" ? "Loop" : "Classic"}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {(view === "board" || view === "tree") && (
                 <div className="relative order-last w-full sm:order-none sm:w-64">
                   <SearchIcon aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   <Input ref={filterRef} aria-label="Filter issues" aria-keyshortcuts="/" name="issue-filter" autoComplete="off" spellCheck={false} placeholder="Filter by title, label, @person" value={filter}
@@ -331,8 +372,8 @@ export default function App() {
                     : <kbd aria-hidden className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 md:inline-flex">/</kbd>}
                 </div>
               )}
-              <Button variant="outline" size="icon-sm" aria-label="Refresh" aria-keyshortcuts="r" title="Refresh (r)" disabled={!repo || loading} onClick={() => void load(repo)}>
-                <RefreshCwIcon className={cn(loading && "animate-spin")} />
+              <Button variant="outline" size="icon-sm" aria-label="Refresh" aria-keyshortcuts="r" title="Refresh (r)" disabled={!repo || loading} onClick={refresh}>
+                <RefreshCwIcon className={cn((loading || loop.loading) && "animate-spin")} />
               </Button>
               <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" aria-keyshortcuts="n" title="New issue (n)" onClick={() => newIssue()}><PlusIcon />New issue</Button>
             </div>
@@ -350,13 +391,18 @@ export default function App() {
               <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
                 <Checkbox checked={autoApprove} onCheckedChange={(v) => setAutoApprove(v === true)} /> Auto-approve writes
               </label>
+              {auth.chatMode !== "classic" && (
+                <p className="w-full text-[11.5px] leading-snug text-muted-foreground" title="The chat has no tool that commits files. Code is written by the delivery loop from the issues you approve here.">
+                  <span className="font-medium text-foreground/80">Planner.</span> This chat plans with you and creates issues only. The delivery loop writes the code.
+                </p>
+              )}
               {(actor || auth.claude) && (
                 <div className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted-foreground">
                   {actor && <><span>GitHub writes</span><ActorChip actor={actor} onChange={changeActor} title={`Issues, comments and commits made from this chat are attributed to @${actor.login}`} /></>}
                   {auth.claude && (
                     <button type="button" onClick={() => setSettingsOpen(true)} title="Claude sign-in method. Click to change it in Settings."
                       className="ml-auto rounded px-1 hover:bg-accent hover:text-foreground">
-                      Claude: {auth.claude.label}{auth.claude.tail && <span className="font-mono"> {auth.claude.tail}</span>}{auth.claude.billing === "api" && " · API billing"}
+                      Claude: {auth.plannerModel ? `${auth.plannerModel} · ` : ""}{auth.claude.label}{auth.claude.tail && <span className="font-mono"> {auth.claude.tail}</span>}{auth.claude.billing === "api" && " · API billing"}
                     </button>
                   )}
                 </div>
