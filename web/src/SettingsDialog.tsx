@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { CircleAlertIcon, CircleCheckIcon, Loader2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ProvidersSection } from "./settings/ProvidersSection";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -67,7 +68,7 @@ export function SettingsDialog({ open, onOpenChange, onChanged }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="scroll-thin max-h-[92dvh] gap-5 overflow-y-auto rounded-xl" onOpenAutoFocus={(e) => e.preventDefault()}>
+      <DialogContent className="scroll-thin max-h-[92dvh] gap-5 overflow-y-auto rounded-xl sm:max-w-2xl" onOpenAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
           <DialogTitle className="text-base">Settings</DialogTitle>
           <DialogDescription>How the chat signs in to Claude. Keys and tokens are saved only on the computer running gh-board and are never shown again.</DialogDescription>
@@ -147,6 +148,9 @@ export function SettingsDialog({ open, onOpenChange, onChanged }: Props) {
             </div>
           </DialogFooter>
         </form>
+        <div className="border-t pt-4">
+          <ProvidersSection />
+        </div>
       </DialogContent>
     </Dialog>
   );

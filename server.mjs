@@ -10,9 +10,11 @@ import { z } from 'zod';
 import { EMPTY_DIR, parseRepo, checkoutDir, syncRepo, isSynced, guardTool, dropCheckout } from './repo-cache.mjs';
 import { createAccounts } from './accounts.mjs';
 import { createClaudeAuth } from './claude-auth.mjs';
+import { initProviders, providerRoutes, isClaude, runProviderChat, defineTool } from './providers/index.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
+initProviders(); // moves provider API keys (OPENAI_API_KEY, ...) out of process.env so no child process inherits them
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.STATUS_PREFIX || 'status:';
 const COLUMNS = (process.env.COLUMNS || 'Backlog,Todo,In progress,Review,Done').split(',').map((s) => s.trim()).filter(Boolean);
@@ -326,10 +328,9 @@ const R = z.string().describe('owner/name');
 
 const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file'];
 
-function makeServer(ctx) {
-  return createSdkMcpServer({
-    name: 'gh', version: '2.0.0',
-    tools: [
+// One list of tool definitions feeds both the Claude MCP server (makeServer) and the generic provider loop (providers/).
+function ghTools(ctx, T = defineTool) {
+  return [
       T('list_repos', 'Repos the user can access, including ones they were invited to.', {}, () => listRepos()),
       T('list_issues', 'Issues with board column, labels, parent and sub-issue progress.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional() }, (a) => listIssues(a.repo, a.state, a.label, a.milestone)),
       T('get_issue', 'One issue: full body, comments, parent and sub-issues.', { repo: R, number: z.number() }, (a) => getIssue(a.repo, a.number)),
@@ -365,9 +366,9 @@ function makeServer(ctx) {
         if (content === undefined) throw new Error('Provide content or from_file');
         return commitFile(a.repo, { path: a.path, content, message: a.message, branch: a.branch });
       }),
-    ],
-  });
+  ];
 }
+const makeServer = (ctx) => createSdkMcpServer({ name: 'gh', version: '2.0.0', tools: ghTools(ctx).map((d) => T(d.name, d.description, d.shape, d.run)) });
 
 const READ_TOOLS = READ_NAMES.map((t) => `mcp__gh__${t}`);
 const pending = new Map();
@@ -458,7 +459,7 @@ const PREVIEW_TOOLS = new Set(['create_issue', 'create_issues', 'update_issue', 
 const sessionCwd = new Map(); // sessionId -> cwd it was created in (the SDK stores sessions per cwd)
 
 async function chat(req, res) {
-  const { message, repo, sessionId, autoApprove, files, chatId } = await readBody(req);
+  const { message, repo, sessionId, autoApprove, files, chatId, provider, model } = await readBody(req);
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   const send = (o) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(o)}\n\n`); };
   const abort = new AbortController();
@@ -478,6 +479,19 @@ async function chat(req, res) {
   let actor = '';
   if (repoName) try { actor = (await accounts.accountFor(repoName)).login; } catch {}
   if (actor) send({ type: 'actor', repo: repoName, login: actor });
+
+  // Any provider other than Claude runs on the generic tool loop in providers/, with the same tools, prompt and approval gate.
+  if (!isClaude(provider)) {
+    try {
+      await runProviderChat({
+        providerId: provider, model, sessionId, autoApprove, repoName, checkout, send, signal: abort.signal, pending, mine,
+        systemPrompt: systemPrompt(repoName || repo, checkout), content: buildPrompt(message, files, ctx.uploads),
+        defs: ghTools(ctx), readNames: READ_NAMES, previewTools: PREVIEW_TOOLS, readOnly: READ_ONLY, trunc,
+        ensureSynced: async () => { if (!isSynced(repoName)) await syncCheckout(repoName, { onProgress: (text) => send({ type: 'progress', text }) }); },
+      });
+    } catch (e) { if (!abort.signal.aborted) send({ type: 'error', error: String(e.message || e) }); }
+    return res.end();
+  }
 
   // Read / Glob / Grep are allowed only inside the checkout. First use syncs the repo if this server has not yet.
   const guard = async (toolName, inp, toolUseId) => {
@@ -621,6 +635,7 @@ const routes = {
   'POST /api/issue/parent': (u, b) => setParent(b.repo, b.number, b.parent ?? null),
   'POST /api/issue/comment': (u, b) => commentIssue(b.repo, b.number, b.body),
   'POST /api/label/create': (u, b) => createLabel(b.repo, b),
+  ...providerRoutes(),
 };
 
 const DIST = join(__dirname, 'web', 'dist');
