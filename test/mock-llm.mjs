@@ -31,6 +31,16 @@ export const SCRIPTS = {
   ][step],
   retrywrite: (step, { repo }) => (step < 3 ? { calls: [{ name: 'create_issue', args: { repo: repo || 'o/r', title: 'Mock issue' } }] } : { text: 'I will stop retrying.' }),
   hello: () => ({ text: 'Hello from the mock model. No tools needed.' }),
+  // The planner flow: one create_issues call with keys and depends_on, then an attempt to commit a file.
+  planner: (step, { repo }) => [
+    { text: 'Proposed backlog: one epic, two tasks.', calls: [{ name: 'create_issues', args: { repo, issues: [{ title: 'Epic: PDF export', labels: ['epic'], body: '## Goal\nExport as PDF.\n\n## Tasks\n', children: [
+      { title: 'Render the PDF', key: 'render', depends_on: ['scaffold', '#3'], labels: ['task', 'module:api', 'size:M', 'agent-authored'], body: '## Context\nSpec §8.\n\n## Acceptance criteria\n- [ ] `bash scripts/check.sh` passes\n- [ ] `npm test -- export/pdf` passes' },
+      { title: 'Scaffold the PDF module', key: 'scaffold', depends_on: [], labels: ['task', 'module:api', 'size:S', 'agent-authored'], body: '## Context\nSpec §8.\n\n## Acceptance criteria\n- [ ] `test -f src/export/pdf.ts`' },
+      { title: 'Vague follow-up', key: 'vague', depends_on: ['render'], labels: ['task'], body: 'Make it nice.' },
+    ] }] } }] },
+    { calls: [{ name: 'commit_file', args: { repo, path: 'src/x.ts', content: 'x' } }] },
+    { text: 'Created the backlog. I cannot commit files.' },
+  ][step],
   badjson: (step) => [{ calls: [{ name: 'list_issues', rawArgs: '{"repo": "o/r", ' }] }, { text: 'Recovered after the bad arguments.' }][step],
   unknown: (step) => [{ calls: [{ name: 'run_shell', args: { cmd: 'whoami' } }] }, { text: 'No shell here, understood.' }][step],
   loopfail: () => ({ calls: [{ name: 'list_issues', args: { repo: 'not a repo' } }] }),

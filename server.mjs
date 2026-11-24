@@ -11,6 +11,11 @@ import { EMPTY_DIR, parseRepo, checkoutDir, syncRepo, isSynced, guardTool, dropC
 import { createAccounts } from './accounts.mjs';
 import { createClaudeAuth } from './claude-auth.mjs';
 import { initProviders, providerRoutes, isClaude, runProviderChat, defineTool } from './providers/index.mjs';
+import { createRunner } from './runner/index.mjs';
+import { createLoopApi } from './loop/github.mjs';
+import { lintIssue } from './loop/lint.mjs';
+import { planBacklog, finalBody, finalLabels, epicBodyWithTasks, isEpicDraft, lintDrafts } from './loop/backlog.mjs';
+import { plannerPrompt } from './loop/planner-prompt.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
@@ -21,6 +26,9 @@ const COLUMNS = (process.env.COLUMNS || 'Backlog,Todo,In progress,Review,Done').
 const DONE = COLUMNS[COLUMNS.length - 1];
 // READ_ONLY=1: the agent can read, analyze and propose, but nothing in this process can write to GitHub.
 const READ_ONLY = /^(1|true|yes)$/i.test(process.env.READ_ONLY || '');
+// Chat mode. "planner" (default): the chat plans WITH the user and produces issues only; it cannot commit files.
+// CHAT_MODE=classic restores the older board-manager chat, which could also commit files.
+const PLANNER = !/^classic$/i.test(process.env.CHAT_MODE || '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------- GitHub -------------------------------- */
@@ -37,12 +45,18 @@ const accounts = createAccounts({
   cliToken: () => (GITHUB_API === 'https://api.github.com' ? execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim() : ''),
 });
 const claudeAuth = createClaudeAuth({ dir: DATA_DIR, envFile: join(__dirname, '.env') });
+// The delivery loop: gh-board drives the delivery-loop plugin (runner/) and shows its state (loop/). See docs/PLATFORM.md.
+const runner = createRunner({
+  dataDir: DATA_DIR, accounts, claudeAuth, readOnly: READ_ONLY,
+  workRoot: process.env.RUNNER_WORKSPACES || join(DATA_DIR, '.workspaces'), runsRoot: process.env.RUNNER_RUNS || join(DATA_DIR, '.runs'),
+});
+const loopApi = createLoopApi({ forRepo: (repo) => accounts.forRepo(repo), getModules: (repo) => runner.modulesOf(repo) });
 let device = null;
 
 async function authStatus() {
   const s = await accounts.status();
   const { method, label, source, tail, model, billing } = claudeAuth.status();
-  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, claude: { method, label, source, tail, model, billing } };
+  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, chatMode: PLANNER ? 'planner' : 'classic', claude: { method, label, source, tail, model, billing } };
 }
 async function connectToken(token) {
   const added = await accounts.addToken(token, 'token');
@@ -185,6 +199,49 @@ async function createTree(repo, items, parent) {
   return out;
 }
 
+/**
+ * Planner path of create_issues: create a delivery-loop backlog. Drafts point at each other with `key` /
+ * `depends_on`; issues are created parents-first and dependencies-first so the `Depends-on: #N` and
+ * `Part of epic #E` lines carry real numbers, epics get their task list, and every issue comes back with its
+ * readiness lint so the chat can fix gaps.
+ */
+async function createBacklog(repo, items, parentNumber) {
+  const plan = planBacklog(items); // throws on unknown keys and cycles before anything is written
+  const numbers = new Map(); const made = new Map();
+  for (const idx of plan.order) {
+    const n = plan.nodes[idx];
+    const parent = n.parent !== null ? plan.nodes[n.parent] : null;
+    const parentNum = parent ? numbers.get(parent.idx) : parentNumber;
+    const body = finalBody(n, (i) => numbers.get(i), parent && isEpicDraft(parent) ? parentNum : null);
+    const labels = finalLabels(n, n.depNums.length + n.depIdx.length > 0);
+    const issue = await createIssue(repo, { title: n.title, body, labels, assignees: n.assignees, milestone: n.milestone, column: n.column, parent_number: parentNum });
+    numbers.set(idx, issue.number); made.set(idx, { number: issue.number, title: n.title, body, labels });
+    await sleep(250);
+  }
+  for (const n of plan.nodes) {
+    if (!n.kids.length || !isEpicDraft(n)) continue;
+    const me = made.get(n.idx);
+    const next = epicBodyWithTasks(me.body, n.kids.map((k) => made.get(k)));
+    if (next !== me.body) { await updateIssue(repo, me.number, { body: next }); me.body = next; }
+  }
+  const ctx = await loopApi.known(repo).catch(() => ({ modules: [], known: new Map() }));
+  loopApi.drop(repo);
+  const known = new Map(ctx.known); for (const m of made.values()) known.set(m.number, 'open');
+  const tree = (idxs) => idxs.map((i) => ({ number: made.get(i).number, title: made.get(i).title, children: tree(plan.nodes[i].kids) }));
+  const readiness = [...made.values()].map((m) => { const r = lintIssue(m, { modules: ctx.modules, known }); return { number: m.number, kind: r.kind, ready: r.ready, problems: r.problems.map((p) => p.message) }; });
+  const gaps = readiness.filter((r) => r.kind === 'task' && !r.ready);
+  return { created: tree(plan.nodes.filter((n) => n.parent === null).map((n) => n.idx)), readiness, note: gaps.length ? `${gaps.length} task(s) are not ready for the loop yet. Fix the listed problems with update_issue, then tell the user.` : 'Every task is ready for the loop.' };
+}
+
+/** Readiness lint of existing issues (all open issues, or the given numbers). */
+async function checkIssues(repo, numbers) {
+  const ctx = await loopApi.known(repo);
+  const { gh, paged } = await forRepo(repo);
+  const list = numbers?.length ? await Promise.all(numbers.map((n) => gh(`/repos/${repo}/issues/${n}`))) : (await paged(`/repos/${repo}/issues?state=open`, 3)).filter((i) => !i.pull_request);
+  return list.map((i) => { const r = lintIssue({ number: i.number, title: i.title, body: i.body || '', labels: i.labels }, ctx); return { number: i.number, title: i.title, kind: r.kind, ready: r.ready, problems: r.problems.map((p) => p.message) }; })
+    .filter((r) => numbers?.length || r.kind !== 'epic' || r.problems.length);
+}
+
 async function updateIssue(repo, number, { title, body, assignees, add_labels, remove_labels, state, milestone }) {
   const { gh } = await forRepo(repo);
   const patch = {};
@@ -298,6 +355,7 @@ async function attachToIssue(ctx, repo, number, filename, note) {
     const out = await commentIssue(repo, number, `${note ? note + '\n\n' : ''}<details><summary>Attachment: ${filename}</summary>\n\n~~~~\n${f.buf.toString('utf8')}\n~~~~\n</details>`);
     return { mode: 'comment', ...out };
   }
+  if (PLANNER) throw new Error(`"${filename}" is too large or not text, and this chat does not commit files. Ask the user to attach it on GitHub, or paste the relevant part into the issue.`);
   const saved = await commitFile(repo, { path: `attachments/${number}/${filename}`, content: f.buf, message: `Attach ${filename} to #${number}`, branch: 'board-attachments' });
   const out = await commentIssue(repo, number, `${note ? note + '\n\n' : ''}Attachment: [${filename}](${saved.url}) (branch \`board-attachments\`)`);
   return { mode: 'committed', file: saved.url, ...out };
@@ -310,7 +368,7 @@ function generateFile(ctx, filename, content) {
   const id = randomUUID();
   downloads.set(id, { name, buf, exp: Date.now() + 3600e3 });
   ctx.send({ type: 'file', id, name, size: buf.length });
-  return { saved: name, bytes: buf.length, note: 'Shown to the user as a download. Use attach_to_issue or commit_file to place it in the repo.' };
+  return { saved: name, bytes: buf.length, note: PLANNER ? 'Shown to the user as a download. Small text files can be added to an issue with attach_to_issue; this chat cannot commit files.' : 'Shown to the user as a download. Use attach_to_issue or commit_file to place it in the repo.' };
 }
 
 /* ----------------------------- Agent tools ------------------------------ */
@@ -326,17 +384,22 @@ const issueIn = {
 };
 const R = z.string().describe('owner/name');
 
-const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file'];
+const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file', 'check_issues'];
+// Planner drafts can name each other before they have numbers.
+const draftIn = { ...issueIn, key: z.string().optional().describe('Short id for this draft, unique in the call, so other drafts can depend on it'), depends_on: z.array(z.string()).optional().describe('Keys of drafts in this call and/or existing issues as "#12". The server writes the Depends-on line and the status label') };
 
 // One list of tool definitions feeds both the Claude MCP server (makeServer) and the generic provider loop (providers/).
 function ghTools(ctx, T = defineTool) {
-  return [
+  const all = [
       T('list_repos', 'Repos the user can access, including ones they were invited to.', {}, () => listRepos()),
       T('list_issues', 'Issues with board column, labels, parent and sub-issue progress.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional() }, (a) => listIssues(a.repo, a.state, a.label, a.milestone)),
       T('get_issue', 'One issue: full body, comments, parent and sub-issues.', { repo: R, number: z.number() }, (a) => getIssue(a.repo, a.number)),
       T('list_sub_issues', 'Children of an issue.', { repo: R, number: z.number() }, (a) => listSubIssues(a.repo, a.number)),
       T('create_issue', 'Create one issue; optional column, labels, assignees, milestone number and parent_number (makes it a sub-issue).', { repo: R, ...issueIn, parent_number: z.number().optional() }, ({ repo, ...r }) => createIssue(repo, r)),
-      T('create_issues', 'Create a hierarchy in one call: epics with children (sub-issues). Use for imports from specs/files.', { repo: R, issues: z.array(z.object({ ...issueIn, children: z.array(z.object(issueIn)).optional() })), parent_number: z.number().optional() }, (a) => createTree(a.repo, a.issues, a.parent_number)),
+      PLANNER
+        ? T('create_issues', 'Create a delivery-loop backlog in ONE call: epics with their tasks as children. Give each draft a key and list depends_on (keys or "#N"); the server creates them in dependency order, writes "Depends-on: #N" and "Part of epic #E", lists the tasks in the epic, sets status:blocked / status:ready, and returns a readiness report per issue.', { repo: R, issues: z.array(z.object({ ...draftIn, children: z.array(z.object(draftIn)).optional() })), parent_number: z.number().optional() }, (a) => createBacklog(a.repo, a.issues, a.parent_number))
+        : T('create_issues', 'Create a hierarchy in one call: epics with children (sub-issues). Use for imports from specs/files.', { repo: R, issues: z.array(z.object({ ...issueIn, children: z.array(z.object(issueIn)).optional() })), parent_number: z.number().optional() }, (a) => createTree(a.repo, a.issues, a.parent_number)),
+      T('check_issues', 'Readiness check for the delivery loop: which issues lack executable acceptance criteria, a size, a module, a status label or valid Depends-on. Omit numbers to check every open issue.', { repo: R, numbers: z.array(z.number()).optional() }, (a) => checkIssues(a.repo, a.numbers)),
       T('update_issue', 'Edit title/body/assignees/labels/milestone (number, or null to clear)/state.', { repo: R, number: z.number(), title: z.string().optional(), body: z.string().optional(), assignees: z.array(z.string()).optional(), add_labels: z.array(z.string()).optional(), remove_labels: z.array(z.string()).optional(), milestone: z.number().nullable().optional(), state: z.enum(['open', 'closed']).optional() }, ({ repo, number, ...r }) => updateIssue(repo, number, r)),
       T('move_issue', `Move to a board column: ${COLUMNS.join(', ')}.`, { repo: R, number: z.number(), column: z.string() }, (a) => moveIssue(a.repo, a.number, a.column)),
       T('set_parent', 'Make an issue a sub-issue of parent_number, or detach it (parent_number null).', { repo: R, number: z.number(), parent_number: z.number().nullable() }, (a) => setParent(a.repo, a.number, a.parent_number)),
@@ -367,13 +430,16 @@ function ghTools(ctx, T = defineTool) {
         return commitFile(a.repo, { path: a.path, content, message: a.message, branch: a.branch });
       }),
   ];
+  // Planner mode: issues are the only product of the chat. Nothing that writes to the repo's git content is offered.
+  return PLANNER ? all.filter((t) => t.name !== 'commit_file') : all;
 }
 const makeServer = (ctx) => createSdkMcpServer({ name: 'gh', version: '2.0.0', tools: ghTools(ctx).map((d) => T(d.name, d.description, d.shape, d.run)) });
 
 const READ_TOOLS = READ_NAMES.map((t) => `mcp__gh__${t}`);
 const pending = new Map();
 
-function systemPrompt(repo, checkout, actor) {
+function systemPrompt(repo, checkout, actor, loop) {
+  if (PLANNER) return plannerPrompt({ repo, checkout, actor, loop, readOnly: READ_ONLY });
   return `You manage a GitHub issues kanban board for the user, and you can analyze the selected repo's whole codebase the way a senior engineer would, then turn what you find into well-grounded issues.
 Current repo: ${repo || '(none selected - ask or use list_repos)'}.${actor ? `
 GitHub identity: every read and write on ${repo} is made as @${actor}, so issues, comments and commits you create are attributed to @${actor}. Several accounts may be connected; list_repos shows which account serves each repo. You cannot switch accounts yourself - the user picks the account for a repo in the board.` : ''}
@@ -479,13 +545,16 @@ async function chat(req, res) {
   let actor = '';
   if (repoName) try { actor = (await accounts.accountFor(repoName)).login; } catch {}
   if (actor) send({ type: 'actor', repo: repoName, login: actor });
+  // What the loop expects in this repo (gate, modules, base branch), so the planner writes issues it can run.
+  let loopCtx = null;
+  if (PLANNER && repoName) try { const r = await runner.readiness(repoName); loopCtx = { initialized: r.initialized, gateOk: r.gate.ok, ...r.conf }; } catch {}
 
   // Any provider other than Claude runs on the generic tool loop in providers/, with the same tools, prompt and approval gate.
   if (!isClaude(provider)) {
     try {
       await runProviderChat({
         providerId: provider, model, sessionId, autoApprove, repoName, checkout, send, signal: abort.signal, pending, mine,
-        systemPrompt: systemPrompt(repoName || repo, checkout), content: buildPrompt(message, files, ctx.uploads),
+        systemPrompt: systemPrompt(repoName || repo, checkout, '', loopCtx), content: buildPrompt(message, files, ctx.uploads),
         defs: ghTools(ctx), readNames: READ_NAMES, previewTools: PREVIEW_TOOLS, readOnly: READ_ONLY, trunc,
         ensureSynced: async () => { if (!isSynced(repoName)) await syncCheckout(repoName, { onProgress: (text) => send({ type: 'progress', text }) }); },
       });
@@ -525,7 +594,7 @@ async function chat(req, res) {
         abortController: abort, env, cwd,
         model: claudeAuth.model() || undefined,
         resume,
-        systemPrompt: systemPrompt(repoName || repo, checkout, actor),
+        systemPrompt: systemPrompt(repoName || repo, checkout, actor, loopCtx),
         mcpServers: { gh: makeServer(ctx) },
         // Built-ins: read-only exploration only. No shell, no writes, no network, no subagents.
         tools: ['Read', 'Glob', 'Grep'],
@@ -618,6 +687,8 @@ const routes = {
   'GET /api/repo/account': (u) => accounts.repoAccount(checkRepo(q(u, 'repo'))),
   'POST /api/repo/account': (u, b) => accounts.setRepoAccount(checkRepo(b.repo), b.login ? String(b.login) : null),
   'GET /api/settings': () => ({ claude: claudeAuth.status(), readOnly: READ_ONLY }),
+  // What the chat can do in this mode (the UI shows it; tests assert the planner has no commit tool).
+  'GET /api/chat/tools': () => ({ mode: PLANNER ? 'planner' : 'classic', tools: ghTools({}).map((t) => t.name), readOnly: READ_ONLY }),
   'POST /api/settings/claude': (u, b) => ({ claude: claudeAuth.update({ ...(b.method !== undefined && { method: b.method, secret: b.secret }), ...(b.model !== undefined && { model: b.model }) }) }),
   'POST /api/settings/claude/remove': (u, b) => ({ claude: claudeAuth.remove(b.method) }),
   'POST /api/settings/claude/test': () => claudeAuth.test({ runAgent: agentPing }),
@@ -636,6 +707,28 @@ const routes = {
   'POST /api/issue/comment': (u, b) => commentIssue(b.repo, b.number, b.body),
   'POST /api/label/create': (u, b) => createLabel(b.repo, b),
   ...providerRoutes(),
+
+  /* ---- the delivery loop: live state, inbox, evidence-first review ---- */
+  'GET /api/loop': (u) => loopApi.snapshot(checkRepo(q(u, 'repo')), { fresh: !!q(u, 'fresh') }),
+  'GET /api/loop/pr': (u) => loopApi.review(checkRepo(q(u, 'repo')), Number(q(u, 'number'))),
+  // The three human actions. Each needs confirm: true from the UI's confirmation step, and READ_ONLY blocks all of them.
+  'POST /api/loop/pr/merge': (u, b) => loopApi.merge(checkRepo(b.repo), { number: Number(b.number), sha: b.sha, confirm: b.confirm }),
+  'POST /api/loop/pr/request-changes': (u, b) => loopApi.requestChanges(checkRepo(b.repo), { number: Number(b.number), body: b.body, confirm: b.confirm, resetBudget: b.resetBudget === true }),
+  'POST /api/loop/pr/close': (u, b) => loopApi.close(checkRepo(b.repo), { number: Number(b.number), confirm: b.confirm, reason: b.reason }),
+  'POST /api/loop/lint': async (u, b) => lintDrafts(Array.isArray(b.drafts) ? b.drafts : [], await loopApi.known(checkRepo(b.repo)).catch(() => ({}))),
+  'GET /api/readiness': (u) => runner.readiness(checkRepo(q(u, 'repo'))),
+
+  /* ---- the runner: start / stop delivery ticks ---- */
+  'GET /api/runner': (u) => runner.preflight(checkRepo(q(u, 'repo'))),
+  'GET /api/runner/status': (u) => runner.status(checkRepo(q(u, 'repo'))),
+  'GET /api/runner/log': async (u) => { const repo = checkRepo(q(u, 'repo')); const ticks = await runner.history(repo); const id = q(u, 'tick') || ticks[0]; return { ticks, tick: id || null, events: id ? await runner.log(repo, id) : [] }; },
+  'POST /api/runner/start': (u, b) => runner.start(checkRepo(b.repo), { mode: b.mode, confirm: b.confirm }),
+  'POST /api/runner/setup': (u, b) => runner.setup(checkRepo(b.repo), { confirm: b.confirm }),
+  'POST /api/runner/stop': (u, b) => runner.stop(checkRepo(b.repo)),
+  'POST /api/runner/stop-all': () => runner.stopAll(),
+  'POST /api/runner/pause': (u, b) => runner.pause(checkRepo(b.repo)),
+  'POST /api/runner/resume': (u, b) => runner.resume(checkRepo(b.repo)),
+  'POST /api/runner/autonomy': (u, b) => runner.setAutonomy(checkRepo(b.repo), { autonomy: b.autonomy, parallel: b.parallel, confirm: b.confirm, acknowledge: b.acknowledge }),
 };
 
 const DIST = join(__dirname, 'web', 'dist');
@@ -708,7 +801,11 @@ server.listen(PORT, HOST, () => {
   console.log(`gh-board running at http://localhost:${PORT}`);
   const ca = claudeAuth.status();
   console.log(`Claude auth: ${ca.label} (${ca.source === 'saved' ? 'chosen in Settings' : ca.source === 'env' ? 'from .env' : 'default'})${ca.billing === 'api' ? ' - billed to the Anthropic API account' : ''}`);
-  if (READ_ONLY) console.log('READ_ONLY=1: all writes to GitHub are blocked.');
+  if (READ_ONLY) console.log('READ_ONLY=1: all writes to GitHub are blocked, and the delivery-loop runner is disabled.');
+  console.log(`Chat mode: ${PLANNER ? 'planner (issues only, no commits)' : 'classic'}`);
   if (ca.ambientApiKeyIgnored) console.warn('! ANTHROPIC_API_KEY is set in the shell but not in .env or Settings; it is not used. Add it in Settings to chat on API billing.');
   accounts.list().then((l) => console.log(l.accounts.length ? `GitHub accounts: ${l.accounts.map((a) => `@${a.login} (${a.sourceLabel})`).join(', ')}` : 'GitHub: no account connected yet.'), () => {});
 });
+
+// Stopping the server stops every delivery-loop session it started (whole process tree).
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => { runner.stopAll(); setTimeout(() => process.exit(0), 300).unref(); });
