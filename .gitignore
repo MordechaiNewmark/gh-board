@@ -1,5 +1,7 @@
 .env
 .gh-token
+.gh-accounts.json*
+.claude-auth.json*
 node_modules
 web/dist
 server.log

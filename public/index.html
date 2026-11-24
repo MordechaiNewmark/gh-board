@@ -194,7 +194,7 @@ function openAuth(note) {
         <input type="password" id="aTok" placeholder="ghp_…" autocomplete="off"></label>
       <div class="hint">Use a classic token with <code>repo</code> and <code>read:org</code> so repos you were invited to show up.
         <a href="https://github.com/settings/tokens/new?scopes=repo,read:org&description=gh-board" target="_blank" rel="noopener">Create one on GitHub</a>.
-        If an org uses SSO, authorize the token for it. The token is saved only on this computer, in <code>.gh-token</code>.</div>
+        If an org uses SSO, authorize the token for it. The token is saved only on this computer, in <code>.gh-accounts.json</code>.</div>
     </div>
     <div class="df"><button class="primary" id="aSave">Connect</button>${a.connected ? '<button id="aOut">Disconnect</button>' : ''}</div>`;
   const dlg = $('#authDlg'); if (!dlg.open) dlg.showModal();

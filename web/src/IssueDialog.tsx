@@ -6,13 +6,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { ActorChip } from "@/components/actor";
 import { StateIcon, UserAvatar } from "@/components/issue-bits";
 import { cn } from "@/lib/utils";
-import { api, errMsg, labelStyle, q, type Issue, type Label as GhLabel, type Meta } from "@/lib/api";
+import { api, errMsg, labelStyle, q, type Issue, type Label as GhLabel, type Meta, type RepoAccount } from "@/lib/api";
 
 export type IssueTarget = { number: number | null; parent?: number | null; title?: string; body?: string; column?: string };
 type Props = {
   repo: string; target: IssueTarget; meta: Meta;
+  /** The GitHub account this repo's writes go out as, and a way to pick another one that can access it. */
+  actor?: RepoAccount | null; onActorChange?: (login: string) => void;
   onClose: () => void; onSaved: (message: string) => void; onNavigate: (t: IssueTarget) => void;
   onLabelCreated: (l: GhLabel) => void; onAttach: (number: number) => void;
 };
@@ -33,7 +36,7 @@ function Field({ label, htmlFor, children, hint }: { label: string; htmlFor?: st
   );
 }
 
-export function IssueDialog({ repo, target, meta, onClose, onSaved, onNavigate, onLabelCreated, onAttach }: Props) {
+export function IssueDialog({ repo, target, meta, actor, onActorChange, onClose, onSaved, onNavigate, onLabelCreated, onAttach }: Props) {
   const { number } = target;
   const isStatus = (l: string) => l.toLowerCase().startsWith(meta.prefix.toLowerCase());
   const [issue, setIssue] = useState<Issue | null>(null);
@@ -126,6 +129,7 @@ export function IssueDialog({ repo, target, meta, onClose, onSaved, onNavigate, 
       <DialogContent
         className="flex max-h-[min(92dvh,860px)] flex-col gap-0 overflow-hidden rounded-xl p-0 max-sm:top-auto max-sm:bottom-0 max-sm:max-h-[94dvh] max-sm:max-w-full max-sm:translate-y-0 max-sm:rounded-b-none sm:max-w-[min(960px,calc(100%-2rem))]"
         onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !loading && !failed) { e.preventDefault(); void save(); } }}
+        onOpenAutoFocus={(e) => { const t = document.getElementById("i-title"); if (t) { e.preventDefault(); t.focus(); } }}
       >
         <div className="flex shrink-0 items-center gap-2.5 border-b px-5 py-3 pr-12">
           {issue ? (
@@ -135,6 +139,7 @@ export function IssueDialog({ repo, target, meta, onClose, onSaved, onNavigate, 
           ) : null}
           <DialogTitle className="text-[14px] font-semibold leading-6">{number ? `Issue #${number}` : target.parent ? "New sub-issue" : "New issue"}</DialogTitle>
           <DialogDescription className="min-w-0 truncate text-[13px]">{repo}{target.parent && !number ? ` · sub-issue of #${target.parent}` : ""}</DialogDescription>
+          {actor && <ActorChip actor={actor} onChange={onActorChange} className="ml-auto" title={`Changes and comments you save here are made on GitHub as @${actor.login}`} />}
         </div>
 
         {loading ? (

@@ -6,6 +6,7 @@
   "description": "Kanban board over GitHub issues (including repos you were invited to) with a Claude Agent SDK chat that manages it.",
   "scripts": {
     "start": "node server.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
     "setup": "npm install && npm --prefix web run setup",
     "build": "npm --prefix web run build",
     "dev:web": "npm --prefix web run dev"

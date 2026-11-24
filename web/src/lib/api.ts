@@ -8,8 +8,26 @@ export type Issue = {
   url: string; comments: number; body: string;
   sub_issues?: Issue[]; comment_list?: { by: string; at: string; body: string }[];
 };
-export type Repo = { name: string; private: boolean; issues: boolean; role: string };
-export type Auth = { connected: boolean; login?: string; avatar?: string; source?: string; deviceFlow?: boolean; device?: { status: string; error?: string } | null; error?: string };
+export type RepoAccess = { login: string; role: string };
+/** account = the connected GitHub account used for this repo; accounts = every connected account that can open it. */
+export type Repo = { name: string; private: boolean; issues: boolean; role: string; account?: string; accounts?: RepoAccess[] };
+export type Account = { login: string; avatar: string; source: string; sourceLabel: string; addedAt: string | null; status: "ok" | "attention"; error: string; default: boolean };
+export type HiddenAccount = { login: string; avatar: string; source: string; sourceLabel: string };
+export type ClaudeMethod = "login" | "oauth" | "apikey";
+export type ClaudeBrief = { method: ClaudeMethod; label: string; source: "saved" | "env" | "default"; tail: string; model: string; billing: "api" | "subscription" };
+/** Secrets never come back from the server: only a masked tail such as "••••abcd". */
+export type ClaudeSettings = ClaudeBrief & {
+  saved: { oauth: string | null; apikey: string | null }; env: { oauth: boolean; apikey: boolean };
+  ambientApiKeyIgnored: boolean; modelSource: "saved" | "env" | "default"; models: string[];
+};
+/** The default account fills login/avatar/source (the pre-multi-account shape); accounts lists all of them. */
+export type Auth = {
+  connected: boolean; login?: string; avatar?: string; source?: string; deviceFlow?: boolean;
+  device?: { status: string; error?: string; login?: string } | null; error?: string; readOnly?: boolean;
+  accounts?: Account[]; hidden?: HiddenAccount[]; notices?: string[]; claude?: ClaudeBrief;
+};
+/** Which account a repo's reads and writes go through (this decides attribution on GitHub). */
+export type RepoAccount = { repo: string; login: string; avatar: string; role: string; overridden: boolean; candidates: RepoAccess[] };
 export type BoardData = { columns: string[]; prefix: string; issues: Issue[] };
 export type Meta = { columns: string[]; prefix: string; labels: Label[]; milestones: Milestone[]; assignees: string[] };
 export type TreeEntry = { name: string; path: string; type: "dir" | "file"; size: number };

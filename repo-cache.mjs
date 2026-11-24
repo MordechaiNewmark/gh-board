@@ -3,7 +3,7 @@
 // never in the remote URL, the process arguments, or .git/config.
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, realpath, stat, lstat, open } from 'node:fs/promises';
+import { mkdir, realpath, stat, lstat, open, rm } from 'node:fs/promises';
 import { dirname, join, resolve, relative, isAbsolute, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -166,6 +166,15 @@ export async function syncRepo(repo, { ref, token, info = {}, onProgress = () =>
   })();
   inflight.set(flightKey, run);
   try { return await run; } finally { inflight.delete(flightKey); }
+}
+
+/** Delete a repo's local checkout (used when the only account that could reach it is disconnected). */
+export async function dropCheckout(repo) {
+  const { key } = parseRepo(repo);
+  const dir = checkoutDir(repo); // validated: always CACHE_ROOT/<owner>/<name>
+  await Promise.all([...inflight.entries()].filter(([k]) => k.startsWith(`${key}@`)).map(([, p]) => p.catch(() => {})));
+  last.delete(key);
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
 }
 
 const fmtBytes = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);

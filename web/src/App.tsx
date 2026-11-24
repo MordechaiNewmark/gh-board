@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type HTMLAttributes } from "react";
-import { CircleAlertIcon, FolderGit2Icon, KanbanIcon, LockIcon, PlusIcon, RefreshCwIcon, SearchIcon, SparklesIcon, XIcon } from "lucide-react";
+import { CircleAlertIcon, FolderGit2Icon, KanbanIcon, LockIcon, PlusIcon, RefreshCwIcon, SearchIcon, SettingsIcon, SparklesIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ActorChip } from "@/components/actor";
 import { EmptyState, GithubIcon, UserAvatar } from "@/components/issue-bits";
 import { Toaster, useToasts } from "@/components/toasts";
 import { useResizable } from "@/hooks/use-resizable";
 import { cn } from "@/lib/utils";
-import { api, errMsg, q, type Auth, type BoardData, type Label, type Meta, type Milestone, type Repo } from "@/lib/api";
+import { api, errMsg, q, type Auth, type BoardData, type Label, type Meta, type Milestone, type Repo, type RepoAccount } from "@/lib/api";
 import { AuthDialog } from "./AuthDialog";
 import { IssueDialog, type IssueTarget } from "./IssueDialog";
+import { SettingsDialog } from "./SettingsDialog";
 import { AnalyzeButton, ChatWelcome } from "./chat/Analyze";
 import { ChatRuntimeProvider, chatCtx, setChatRepo } from "./chat/runtime";
 import { Thread } from "./chat/thread";
@@ -61,6 +63,9 @@ export default function App() {
   const [repos, setRepos] = useState<Repo[]>([]);
   const [reposLoading, setReposLoading] = useState(false);
   const [repoQuery, setRepoQuery] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [acctFilter, setAcctFilter] = useState("");
+  const [actor, setActor] = useState<RepoAccount | null>(null);
   const [repo, setRepo] = useState(() => stored("repo"));
   const [data, setData] = useState<BoardData>(EMPTY);
   const [loadedRepo, setLoadedRepo] = useState("");
@@ -108,9 +113,31 @@ export default function App() {
     setReposLoading(true);
     setRepos((await api<Repo[]>("/api/repos").catch(() => [])).filter((r) => r.issues));
     setReposLoading(false);
+    // Listing repos is what reveals a revoked token, so pick up each account's fresh status afterwards.
+    if ((a.accounts?.length ?? 0) > 1) { const again = await api<Auth>("/api/auth/status").catch(() => null); if (again?.connected) setAuth(again); }
     void load(stored("repo"));
   }, [load]);
   useEffect(() => { void boot(); }, [boot]);
+  const refreshAuth = useCallback(async () => { const a = await api<Auth>("/api/auth/status").catch(() => null); if (a) setAuth(a); }, []);
+
+  // Which connected account this repo's reads and writes go through (shown as "as @login" wherever writes happen).
+  const accounts = useMemo(() => auth.accounts ?? [], [auth.accounts]);
+  const accountKey = accounts.map((a) => `${a.login}:${a.status}:${a.default}`).join(",");
+  useEffect(() => {
+    if (!repo || !auth.connected) { setActor(null); return; }
+    let live = true;
+    api<RepoAccount>(`/api/repo/account?repo=${q(repo)}`).then((a) => { if (live) setActor(a); }).catch(() => { if (live) setActor(null); });
+    return () => { live = false; };
+  }, [repo, auth.connected, accountKey]);
+  const changeActor = async (login: string) => {
+    try {
+      setActor(await api<RepoAccount>("/api/repo/account", { repo, login }));
+      setRepos((rs) => rs.map((r) => (r.name.toLowerCase() === repo.toLowerCase() ? { ...r, account: login, role: r.accounts?.find((a) => a.login === login)?.role ?? r.role } : r)));
+      toast(`${repo} now uses @${login}`);
+      void load(repo);
+    } catch (e) { toast(`Could not switch account: ${errMsg(e)}`, "error"); }
+  };
+  useEffect(() => { if (acctFilter && !accounts.some((a) => a.login === acctFilter)) setAcctFilter(""); }, [accounts, acctFilter]);
 
   // Keep the chat in sync with what the board is showing.
   useEffect(() => { setChatRepo(repo); chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => void load(repo); }, [repo, autoApprove, load]);
@@ -160,11 +187,15 @@ export default function App() {
     const by = new Map<string, Repo[]>();
     for (const r of repos) {
       if (f && !r.name.toLowerCase().includes(f)) continue;
+      if (acctFilter && !(r.accounts ?? []).some((a) => a.login === acctFilter)) continue;
       const owner = r.name.split("/")[0];
       by.set(owner, [...(by.get(owner) ?? []), r]);
     }
     return [...by.entries()];
-  }, [repos, repoQuery]);
+  }, [repos, repoQuery, acctFilter]);
+  const multi = accounts.length > 1;
+  const attention = accounts.filter((a) => a.status === "attention");
+  const avatarOf = (login?: string) => accounts.find((a) => a.login === login)?.avatar || undefined;
   const meta: Meta = { columns: current.columns, prefix: current.prefix, labels, milestones, assignees };
   const chat = view === "chat";
   const firstLoad = !!repo && loadedRepo !== repo && !loadError;
@@ -205,11 +236,23 @@ export default function App() {
               <TabsTrigger value="chat" className="px-3 text-[13px] md:hidden">Chat</TabsTrigger>
             </TabsList>
           </Tabs>
-          <Button variant="ghost" size="sm" className="ml-auto h-8 gap-2 px-2" onClick={() => setAuthOpen(true)} aria-label={auth.connected ? `GitHub account: ${auth.login}` : "Connect GitHub"}>
-            {auth.connected && auth.login
-              ? <><UserAvatar login={auth.login} src={auth.avatar} size={22} className="ring-0" /><span className="text-[13px]">{auth.login}</span></>
-              : <><GithubIcon />Connect GitHub</>}
-          </Button>
+          <div className="ml-auto flex items-center gap-1">
+            <Button variant="ghost" size="sm" className="h-8 gap-2 px-2" onClick={() => setAuthOpen(true)}
+              aria-label={!auth.connected ? "Connect GitHub" : multi ? `GitHub accounts: ${accounts.map((a) => a.login).join(", ")}${attention.length ? `. ${attention.length} need attention` : ""}` : `GitHub account: ${auth.login}`}>
+              {auth.connected && auth.login ? (
+                multi ? (
+                  <>
+                    <span className="flex items-center -space-x-1.5">
+                      {accounts.slice(0, 3).map((a) => <UserAvatar key={a.login} login={a.login} src={a.avatar || undefined} size={22} className="ring-2 ring-card" />)}
+                    </span>
+                    <span className="text-[13px]">{accounts.length} accounts</span>
+                  </>
+                ) : <><UserAvatar login={auth.login} src={auth.avatar} size={22} className="ring-0" /><span className="text-[13px]">{auth.login}</span></>
+              ) : <><GithubIcon />Connect GitHub</>}
+              {attention.length > 0 && <span aria-hidden title="An account needs attention" className="size-2 rounded-full bg-amber-500" />}
+            </Button>
+            <Button variant="ghost" size="icon-sm" className="size-8" aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}><SettingsIcon /></Button>
+          </div>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
@@ -221,6 +264,13 @@ export default function App() {
                   placeholder="Find or type owner/name" className="h-8 bg-background pl-8 text-[13px] md:text-[13px]" value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && typedRepo) { pickRepo(typedRepo); setRepoQuery(""); } else if (e.key === "Escape") setRepoQuery(""); }} />
               </div>
+              {multi && (
+                <select aria-label="Filter repositories by account" value={acctFilter} onChange={(e) => setAcctFilter(e.target.value)}
+                  className="mt-2 h-7 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground/80 shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30">
+                  <option value="">All accounts</option>
+                  {accounts.map((a) => <option key={a.login} value={a.login}>@{a.login}</option>)}
+                </select>
+              )}
             </div>
             <div className="scroll-thin flex gap-1.5 overflow-x-auto px-2 pb-2 md:block md:min-h-0 md:flex-1 md:overflow-x-hidden md:overflow-y-auto md:pb-3">
               {reposLoading && repos.length === 0 && (
@@ -234,7 +284,7 @@ export default function App() {
                   {list.map((r) => {
                     const selected = r.name === repo;
                     return (
-                      <button key={r.name} type="button" onClick={() => pickRepo(r.name)} aria-current={selected ? "page" : undefined} title={`${r.name} · ${r.role}${r.private ? " · private" : ""}`}
+                      <button key={r.name} type="button" onClick={() => pickRepo(r.name)} aria-current={selected ? "page" : undefined} title={`${r.name} · ${r.role}${r.private ? " · private" : ""}${multi && r.account ? ` · as @${r.account}${(r.accounts?.length ?? 0) > 1 ? ` (also: ${r.accounts!.filter((a) => a.login !== r.account).map((a) => `@${a.login}`).join(", ")})` : ""}` : ""}`}
                         className={cn(
                           "relative flex shrink-0 items-center gap-1.5 rounded-full border bg-background px-3 py-1 text-left text-[13px] transition-colors md:w-full md:rounded-md md:border-0 md:bg-transparent md:px-2 md:py-[5px]",
                           selected ? "border-brand/50 bg-brand/10 font-medium text-foreground md:bg-accent" : "text-foreground/80 hover:text-foreground md:hover:bg-accent/60",
@@ -243,6 +293,7 @@ export default function App() {
                         <span className="min-w-0 truncate"><span className="text-muted-foreground md:hidden">{o}/</span>{r.name.slice(o.length + 1)}</span>
                         {r.private && <LockIcon aria-label="Private" className="size-3 shrink-0 text-muted-foreground" />}
                         {r.role !== "admin" && <span className="ml-auto hidden shrink-0 rounded border px-1 text-[10px] leading-4 text-muted-foreground md:inline">{r.role}</span>}
+                        {multi && r.account && <UserAvatar login={r.account} src={avatarOf(r.account)} size={14} className={cn("ring-0", r.role === "admin" && "md:ml-auto")} />}
                       </button>
                     );
                   })}
@@ -298,6 +349,17 @@ export default function App() {
               <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
                 <Checkbox checked={autoApprove} onCheckedChange={(v) => setAutoApprove(v === true)} /> Auto-approve writes
               </label>
+              {(actor || auth.claude) && (
+                <div className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted-foreground">
+                  {actor && <><span>GitHub writes</span><ActorChip actor={actor} onChange={changeActor} title={`Issues, comments and commits made from this chat are attributed to @${actor.login}`} /></>}
+                  {auth.claude && (
+                    <button type="button" onClick={() => setSettingsOpen(true)} title="Claude sign-in method. Click to change it in Settings."
+                      className="ml-auto rounded px-1 hover:bg-accent hover:text-foreground">
+                      Claude: {auth.claude.label}{auth.claude.tail && <span className="font-mono"> {auth.claude.tail}</span>}{auth.claude.billing === "api" && " · API billing"}
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
             <div className="min-h-0 flex-1"><Thread components={THREAD_COMPONENTS} /></div>
           </aside>
@@ -305,10 +367,11 @@ export default function App() {
       </div>
 
       <AuthDialog open={authOpen} auth={auth} onOpenChange={setAuthOpen} onChanged={() => void boot()} />
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onChanged={() => void refreshAuth()} />
       {target && (
         <IssueDialog
           key={`${target.number ?? "new"}-${target.parent ?? ""}-${target.column ?? ""}`}
-          repo={repo} target={target} meta={meta}
+          repo={repo} target={target} meta={meta} actor={actor} onActorChange={changeActor}
           onClose={() => setTarget(null)}
           onSaved={(message) => { setTarget(null); toast(message); void load(repo); }}
           onNavigate={setTarget}

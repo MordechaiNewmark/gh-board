@@ -1,13 +1,15 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename, normalize, extname, sep } from 'node:path';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { EMPTY_DIR, parseRepo, checkoutDir, syncRepo, isSynced, guardTool } from './repo-cache.mjs';
+import { EMPTY_DIR, parseRepo, checkoutDir, syncRepo, isSynced, guardTool, dropCheckout } from './repo-cache.mjs';
+import { createAccounts } from './accounts.mjs';
+import { createClaudeAuth } from './claude-auth.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
@@ -21,81 +23,58 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------- GitHub -------------------------------- */
 
-const TOKEN_FILE = join(__dirname, '.gh-token');
+// Several GitHub accounts can be connected at once (accounts.mjs). Every repo-scoped call below asks forRepo()
+// for a client bound to the account that owns that repo; there is no global token.
+const DATA_DIR = process.env.GH_BOARD_DATA_DIR || __dirname; // where .gh-accounts.json and .claude-auth.json live
+const GITHUB_API = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
 const CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
-let _token, _source, _off = false, device = null;
-
-function ghToken() {
-  if (_off) throw new Error('Not connected to GitHub. Click Connect GitHub.');
-  if (_token) return _token;
-  try { const t = readFileSync(TOKEN_FILE, 'utf8').trim(); if (t) { _source = 'saved in this app'; return (_token = t); } } catch {}
-  if (process.env.GITHUB_TOKEN) { _source = 'GITHUB_TOKEN in .env'; return (_token = process.env.GITHUB_TOKEN); }
-  try { const t = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); _source = 'GitHub CLI'; return (_token = t); }
-  catch { throw new Error('Not connected to GitHub. Click Connect GitHub.'); }
-}
-function setToken(t) { writeFileSync(TOKEN_FILE, t, { mode: 0o600 }); _token = t; _source = 'saved in this app'; _off = false; }
-function clearToken() { try { unlinkSync(TOKEN_FILE); } catch {} _token = undefined; _source = undefined; _off = true; device = null; }
+const accounts = createAccounts({
+  dir: DATA_DIR, apiBase: GITHUB_API, readOnly: READ_ONLY,
+  envToken: process.env.GITHUB_TOKEN || '',
+  // The GitHub CLI session belongs to github.com: never send it to an overridden API host.
+  cliToken: () => (GITHUB_API === 'https://api.github.com' ? execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim() : ''),
+});
+const claudeAuth = createClaudeAuth({ dir: DATA_DIR, envFile: join(__dirname, '.env') });
+let device = null;
 
 async function authStatus() {
-  const base = { deviceFlow: !!CLIENT_ID, device };
-  try { const u = await gh('/user'); return { ...base, connected: true, login: u.login, avatar: u.avatar_url, source: _source }; }
-  catch (e) { return { ...base, connected: false, error: String(e.message || e) }; }
+  const s = await accounts.status();
+  const { method, label, source, tail, model, billing } = claudeAuth.status();
+  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, claude: { method, label, source, tail, model, billing } };
 }
 async function connectToken(token) {
-  token = String(token || '').trim();
-  if (!token) throw new Error('Paste a token first.');
-  const prev = [_token, _source, _off];
-  _token = token; _off = false;
-  try { await gh('/user'); } catch (e) { [_token, _source, _off] = prev; throw new Error('GitHub rejected that token.'); }
-  setToken(token);
-  return authStatus();
+  const added = await accounts.addToken(token, 'token');
+  return { ...(await authStatus()), added };
+}
+async function disconnect(login) {
+  const { removed, orphaned } = await accounts.remove(login);
+  device = null;
+  // Checkouts of repos only that account could reach are private to it: drop them with the account.
+  await Promise.all(orphaned.map((r) => dropCheckout(r).catch(() => {})));
+  return { ...(await authStatus()), removed };
 }
 const ghForm = (url, body) => fetch(url, { method: 'POST', headers: { Accept: 'application/json' }, body: new URLSearchParams(body) }).then((r) => r.json());
 async function deviceStart() {
   if (!CLIENT_ID) throw new Error('Set GITHUB_CLIENT_ID in .env to use browser sign-in.');
   const r = await ghForm('https://github.com/login/device/code', { client_id: CLIENT_ID, scope: 'repo read:org' });
   if (!r.device_code) throw new Error(r.error_description || 'Device flow failed. Enable "Device Flow" on the OAuth app.');
-  device = { status: 'pending' };
-  pollDevice(r.device_code, r.interval || 5, Date.now() + r.expires_in * 1000).catch((e) => { device = { status: 'error', error: String(e.message || e) }; });
+  const mine = (device = { status: 'pending' });
+  pollDevice(mine, r.device_code, r.interval || 5, Date.now() + r.expires_in * 1000).catch((e) => { if (device === mine) device = { status: 'error', error: accounts.scrub(e.message || e) }; });
   return { user_code: r.user_code, verification_uri: r.verification_uri };
 }
-async function pollDevice(code, interval, exp) {
-  while (Date.now() < exp) {
+// Each sign-in adds an account (or refreshes the token of one already connected); it never replaces the others.
+async function pollDevice(mine, code, interval, exp) {
+  while (Date.now() < exp && device === mine) {
     await sleep(interval * 1000);
     const r = await ghForm('https://github.com/login/oauth/access_token', { client_id: CLIENT_ID, device_code: code, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }).catch(() => ({}));
-    if (r.access_token) { setToken(r.access_token); device = { status: 'done' }; return; }
+    if (r.access_token) { const added = await accounts.addToken(r.access_token, 'device'); if (device === mine) device = { status: 'done', login: added.login }; return; }
     if (r.error === 'slow_down') interval += 5;
-    else if (r.error && r.error !== 'authorization_pending') { device = { status: 'error', error: r.error_description || r.error }; return; }
+    else if (r.error && r.error !== 'authorization_pending') { if (device === mine) device = { status: 'error', error: r.error_description || r.error }; return; }
   }
-  device = { status: 'error', error: 'Code expired. Try again.' };
+  if (device === mine) device = { status: 'error', error: 'Code expired. Try again.' };
 }
 
-async function gh(path, { method = 'GET', body } = {}) {
-  if (READ_ONLY && method !== 'GET') throw new Error('Read-only mode (READ_ONLY=1): writes to GitHub are disabled.');
-  const res = await fetch(`https://api.github.com${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${ghToken()}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'gh-board',
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`GitHub ${res.status} on ${method} ${path}: ${(await res.text()).slice(0, 300)}`);
-  return res.status === 204 ? null : res.json();
-}
-
-async function paged(path, maxPages = 3) {
-  const out = [];
-  for (let p = 1; p <= maxPages; p++) {
-    const page = await gh(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${p}`);
-    out.push(...page);
-    if (page.length < 100) break;
-  }
-  return out;
-}
+const forRepo = (repo) => accounts.forRepo(checkRepo(repo));
 
 const checkRepo = (repo) => {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '') || repo.split('/').some((p) => p === '.' || p === '..')) throw new Error('repo must be "owner/name"');
@@ -123,13 +102,11 @@ function shape(i, full = false) {
 }
 
 /* ---- repos / issues ---- */
-async function listRepos() {
-  const rs = await paged('/user/repos?sort=pushed&affiliation=owner,collaborator,organization_member', 5);
-  return rs.map((r) => ({ name: r.full_name, private: r.private, issues: r.has_issues, role: r.permissions?.admin ? 'admin' : r.permissions?.push ? 'write' : 'read' }));
-}
+// Merged across every connected account; each repo carries the account that will be used for it.
+const listRepos = () => accounts.listRepos();
 
 async function listIssues(repo, state = 'open', label, milestone) {
-  checkRepo(repo);
+  const { gh, paged } = await forRepo(repo);
   const f = `${label ? `&labels=${encodeURIComponent(label)}` : ''}${milestone ? `&milestone=${milestone}` : ''}`;
   const raw = [];
   if (state === 'open' || state === 'all') raw.push(...(await paged(`/repos/${repo}/issues?state=open&sort=updated${f}`, 3)));
@@ -138,12 +115,12 @@ async function listIssues(repo, state = 'open', label, milestone) {
 }
 
 async function listSubIssues(repo, number) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   return (await gh(`/repos/${repo}/issues/${number}/sub_issues?per_page=100`)).map((i) => shape(i));
 }
 
 async function getIssue(repo, number) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const [i, comments, subs] = await Promise.all([
     gh(`/repos/${repo}/issues/${number}`),
     gh(`/repos/${repo}/issues/${number}/comments?per_page=30`),
@@ -157,7 +134,7 @@ async function getIssue(repo, number) {
 }
 
 async function moveIssue(repo, number, columnName) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const column = colFromName(columnName);
   if (!column) throw new Error(`Unknown column "${columnName}". Columns: ${COLUMNS.join(', ')}`);
   const i = await gh(`/repos/${repo}/issues/${number}`);
@@ -171,7 +148,7 @@ async function moveIssue(repo, number, columnName) {
 }
 
 async function setParent(repo, number, parent) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const child = await gh(`/repos/${repo}/issues/${number}`);
   if (parent == null) {
     const p = child.parent_issue_url?.split('/').pop();
@@ -184,7 +161,7 @@ async function setParent(repo, number, parent) {
 }
 
 async function createIssue(repo, { title, body, labels = [], assignees = [], column, milestone, parent_number }) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const col = column ? colFromName(column) : undefined;
   if (column && !col) throw new Error(`Unknown column "${column}"`);
   const i = await gh(`/repos/${repo}/issues`, {
@@ -207,7 +184,7 @@ async function createTree(repo, items, parent) {
 }
 
 async function updateIssue(repo, number, { title, body, assignees, add_labels, remove_labels, state, milestone }) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const patch = {};
   if (title !== undefined) patch.title = title;
   if (body !== undefined) patch.body = body;
@@ -221,38 +198,39 @@ async function updateIssue(repo, number, { title, body, assignees, add_labels, r
 }
 
 async function commentIssue(repo, number, body) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   return { url: (await gh(`/repos/${repo}/issues/${number}/comments`, { method: 'POST', body: { body } })).html_url };
 }
 
 async function deleteIssue(repo, number) {
-  checkRepo(repo);
+  const { gh, login } = await forRepo(repo);
   const i = await gh(`/repos/${repo}/issues/${number}`);
   const r = await gh('/graphql', { method: 'POST', body: { query: `mutation{deleteIssue(input:{issueId:"${i.node_id}"}){clientMutationId}}` } });
-  if (r.errors?.length) throw new Error(`Delete failed: ${r.errors[0].message} (deleting needs admin rights; close it instead)`);
+  if (r.errors?.length) throw new Error(`Delete failed as @${login}: ${r.errors[0].message} (deleting needs admin rights; close it instead)`);
   return { deleted: number };
 }
 
 /* ---- labels / milestones / people ---- */
-const listLabels = async (repo) => (await paged(`/repos/${checkRepo(repo)}/labels`, 3)).map((l) => ({ name: l.name, color: l.color, description: l.description }));
-const createLabel = (repo, { name, color = 'ededed', description = '' }) => gh(`/repos/${checkRepo(repo)}/labels`, { method: 'POST', body: { name, color: color.replace('#', ''), description } }).then((l) => ({ name: l.name, color: l.color }));
-const updateLabel = (repo, { name, new_name, color, description }) => gh(`/repos/${checkRepo(repo)}/labels/${encodeURIComponent(name)}`, { method: 'PATCH', body: { ...(new_name && { new_name }), ...(color && { color: color.replace('#', '') }), ...(description !== undefined && { description }) } }).then((l) => ({ name: l.name, color: l.color }));
-const deleteLabel = (repo, name) => gh(`/repos/${checkRepo(repo)}/labels/${encodeURIComponent(name)}`, { method: 'DELETE' }).then(() => ({ deleted: name }));
-const listMilestones = async (repo) => (await gh(`/repos/${checkRepo(repo)}/milestones?state=all&per_page=50`)).map((m) => ({ number: m.number, title: m.title, state: m.state, due_on: m.due_on, open: m.open_issues, closed: m.closed_issues }));
-const createMilestone = (repo, b) => gh(`/repos/${checkRepo(repo)}/milestones`, { method: 'POST', body: b }).then((m) => ({ number: m.number, title: m.title }));
-const updateMilestone = (repo, { number, ...b }) => gh(`/repos/${checkRepo(repo)}/milestones/${number}`, { method: 'PATCH', body: b }).then((m) => ({ number: m.number, title: m.title, state: m.state }));
-const listAssignees = async (repo) => (await paged(`/repos/${checkRepo(repo)}/assignees`, 2)).map((u) => u.login);
+const hexColor = (c) => String(c).replace('#', '');
+const listLabels = async (repo) => (await (await forRepo(repo)).paged(`/repos/${repo}/labels`, 3)).map((l) => ({ name: l.name, color: l.color, description: l.description }));
+const createLabel = async (repo, { name, color = 'ededed', description = '' }) => { const l = await (await forRepo(repo)).gh(`/repos/${repo}/labels`, { method: 'POST', body: { name, color: hexColor(color), description } }); return { name: l.name, color: l.color }; };
+const updateLabel = async (repo, { name, new_name, color, description }) => { const l = await (await forRepo(repo)).gh(`/repos/${repo}/labels/${encodeURIComponent(name)}`, { method: 'PATCH', body: { ...(new_name && { new_name }), ...(color && { color: hexColor(color) }), ...(description !== undefined && { description }) } }); return { name: l.name, color: l.color }; };
+const deleteLabel = async (repo, name) => { await (await forRepo(repo)).gh(`/repos/${repo}/labels/${encodeURIComponent(name)}`, { method: 'DELETE' }); return { deleted: name }; };
+const listMilestones = async (repo) => (await (await forRepo(repo)).gh(`/repos/${repo}/milestones?state=all&per_page=50`)).map((m) => ({ number: m.number, title: m.title, state: m.state, due_on: m.due_on, open: m.open_issues, closed: m.closed_issues }));
+const createMilestone = async (repo, b) => { const m = await (await forRepo(repo)).gh(`/repos/${repo}/milestones`, { method: 'POST', body: b }); return { number: m.number, title: m.title }; };
+const updateMilestone = async (repo, { number, ...b }) => { const m = await (await forRepo(repo)).gh(`/repos/${repo}/milestones/${number}`, { method: 'PATCH', body: b }); return { number: m.number, title: m.title, state: m.state }; };
+const listAssignees = async (repo) => (await (await forRepo(repo)).paged(`/repos/${repo}/assignees`, 2)).map((u) => u.login);
 
 /* ---- code ---- */
 async function listTree(repo, path = '', ref) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const r = await gh(`/repos/${repo}/contents/${enc(path)}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`);
   if (!Array.isArray(r)) return [{ name: r.name, path: r.path, type: r.type, size: r.size }];
   return r.map((e) => ({ name: e.name, path: e.path, type: e.type, size: e.size })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
 }
 
 async function readFileGH(repo, path, ref) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const r = await gh(`/repos/${repo}/contents/${enc(path)}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`);
   if (Array.isArray(r)) throw new Error(`${path} is a directory`);
   if (!r.content) throw new Error(`${path} is too large to read through the API (${r.size} bytes)`);
@@ -261,13 +239,13 @@ async function readFileGH(repo, path, ref) {
 }
 
 async function searchCode(repo, q) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   const r = await gh(`/search/code?q=${encodeURIComponent(`${q} repo:${repo}`)}&per_page=20`);
   return r.items.map((i) => ({ path: i.path, url: i.html_url }));
 }
 
 async function commitFile(repo, { path, content, message, branch }) {
-  checkRepo(repo);
+  const { gh } = await forRepo(repo);
   if (branch) {
     const have = await gh(`/repos/${repo}/git/ref/heads/${enc(branch)}`).catch(() => null);
     if (!have) {
@@ -289,8 +267,9 @@ async function commitFile(repo, { path, content, message, branch }) {
 async function syncCheckout(repo, { ref, onProgress, maxAgeMs } = {}) {
   const { full } = parseRepo(repo);
   onProgress?.(`Checking ${full}…`);
+  const { gh, token } = await forRepo(full); // clone with the token of the account that owns this repo
   const info = await gh(`/repos/${full}`);
-  return syncRepo(full, { ref, token: ghToken(), info: { size: info.size, default_branch: info.default_branch }, onProgress, maxAgeMs });
+  return syncRepo(full, { ref, token, info: { size: info.size, default_branch: info.default_branch }, onProgress, maxAgeMs });
 }
 
 /* ---- per-chat file context ---- */
@@ -336,7 +315,7 @@ function generateFile(ctx, filename, content) {
 
 const ok = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data) }] });
 const T = (name, desc, shapeDef, fn) => tool(name, desc, shapeDef, async (args) => {
-  try { return ok(await fn(args)); } catch (e) { return { isError: true, content: [{ type: 'text', text: String(e.message || e) }] }; }
+  try { return ok(await fn(args)); } catch (e) { return { isError: true, content: [{ type: 'text', text: redact(e.message || e) }] }; }
 });
 
 const issueIn = {
@@ -393,9 +372,10 @@ function makeServer(ctx) {
 const READ_TOOLS = READ_NAMES.map((t) => `mcp__gh__${t}`);
 const pending = new Map();
 
-function systemPrompt(repo, checkout) {
+function systemPrompt(repo, checkout, actor) {
   return `You manage a GitHub issues kanban board for the user, and you can analyze the selected repo's whole codebase the way a senior engineer would, then turn what you find into well-grounded issues.
-Current repo: ${repo || '(none selected - ask or use list_repos)'}.
+Current repo: ${repo || '(none selected - ask or use list_repos)'}.${actor ? `
+GitHub identity: every read and write on ${repo} is made as @${actor}, so issues, comments and commits you create are attributed to @${actor}. Several accounts may be connected; list_repos shows which account serves each repo. You cannot switch accounts yourself - the user picks the account for a repo in the board.` : ''}
 Board columns, in order: ${COLUMNS.join(' | ')}. A column is the label "${PREFIX}<Column>"; the last column means closed.
 Hierarchy: GitHub sub-issues. Use create_issues for epics with children, set_parent to restructure, and parent_number on create_issue.
 Files: the user may attach files; their text is in the message. To produce deliverables (specs, CSV exports, reports) use generate_file. To put a file in an issue use attach_to_issue; to put it in the repo use commit_file on a new branch.
@@ -492,8 +472,12 @@ async function chat(req, res) {
   mkdirSync(cwd, { recursive: true });
 
   const ctx = { ...filesFor(chatId), send, repo: repoName, checkout };
-  const env = { ...process.env };
-  for (const k of ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'GH_TOKEN', 'ACCESS_KEY']) delete env[k];
+  // The agent process gets one Claude credential (the method chosen in Settings) and no GitHub token at all:
+  // GitHub calls happen in this process, through forRepo(), with the token of the account that owns the repo.
+  const env = claudeAuth.agentEnv(process.env);
+  let actor = '';
+  if (repoName) try { actor = (await accounts.accountFor(repoName)).login; } catch {}
+  if (actor) send({ type: 'actor', repo: repoName, login: actor });
 
   // Read / Glob / Grep are allowed only inside the checkout. First use syncs the repo if this server has not yet.
   const guard = async (toolName, inp, toolUseId) => {
@@ -525,9 +509,9 @@ async function chat(req, res) {
       prompt: input(),
       options: {
         abortController: abort, env, cwd,
-        model: process.env.CLAUDE_MODEL || undefined,
+        model: claudeAuth.model() || undefined,
         resume,
-        systemPrompt: systemPrompt(repoName || repo, checkout),
+        systemPrompt: systemPrompt(repoName || repo, checkout, actor),
         mcpServers: { gh: makeServer(ctx) },
         // Built-ins: read-only exploration only. No shell, no writes, no network, no subagents.
         tools: ['Read', 'Glob', 'Grep'],
@@ -578,20 +562,51 @@ async function chat(req, res) {
         }
       } else if (m.type === 'user' && Array.isArray(m.message?.content)) {
         for (const b of m.message.content) if (b.type === 'tool_result') send({ type: 'tool_result', id: b.tool_use_id, isError: !!b.is_error });
-      } else if (m.type === 'result') { send({ type: 'done', error: m.is_error ? (m.result || m.subtype) : undefined }); finish(); }
+      } else if (m.type === 'result') { send({ type: 'done', error: m.is_error ? redact(m.result || m.subtype) : undefined }); finish(); }
     }
   } catch (e) {
-    if (!abort.signal.aborted) send({ type: 'error', error: String(e.message || e) });
+    if (!abort.signal.aborted) send({ type: 'error', error: redact(e.message || e) });
   } finally { finish(); }
   res.end();
 }
 
+/** Last line of defence: no stored GitHub token or Claude secret may leave in a response or a log line. */
+const redact = (v) => claudeAuth.scrub(accounts.scrub(String(v ?? '')));
+
+// One tiny prompt through the Agent SDK, used by "Test connection" for the login session and the OAuth token.
+async function agentPing(env, model) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 60000);
+  mkdirSync(EMPTY_DIR, { recursive: true });
+  try {
+    for await (const m of query({ prompt: 'Reply with the single word OK.', options: { abortController: abort, env, cwd: EMPTY_DIR, model, tools: [], allowedTools: [], settingSources: [], maxTurns: 1, systemPrompt: 'This is a connection test. Reply with the single word OK.' } })) {
+      if (m.type === 'result') {
+        if (m.is_error) throw new Error(String(m.result || m.subtype || 'Claude returned an error.'));
+        return 'Claude answered. Chat usage counts against your Claude subscription.';
+      }
+    }
+    throw new Error('Claude did not answer.');
+  } catch (e) {
+    throw new Error(abort.signal.aborted ? 'Timed out after 60 seconds waiting for Claude.' : String(e.message || e));
+  } finally { clearTimeout(timer); }
+}
+
 const q = (url, k) => url.searchParams.get(k);
 const routes = {
-  'GET /api/auth/status': () => authStatus().then((a) => ({ ...a, readOnly: READ_ONLY })),
-  'POST /api/auth/token': (u, b) => connectToken(b.token),
+  'GET /api/auth/status': () => authStatus(),
+  // ?check=1 re-validates every token, so a revoked one shows as "needs attention".
+  'GET /api/auth/accounts': async (u) => ({ ...(q(u, 'check') ? await accounts.check() : await accounts.list()), deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY }),
+  'POST /api/auth/token': (u, b) => connectToken(b.token), // adds an account, or refreshes the token of the same login
   'POST /api/auth/device': () => deviceStart(),
-  'POST /api/auth/logout': () => { clearToken(); return { connected: false }; },
+  'POST /api/auth/logout': (u, b) => disconnect(b.login), // { login }; without one, the default account
+  'POST /api/auth/default': (u, b) => accounts.setDefault(String(b.login || '')).then(authStatus),
+  'POST /api/auth/reconnect': (u, b) => accounts.reconnect(String(b.login || '')).then(authStatus),
+  'GET /api/repo/account': (u) => accounts.repoAccount(checkRepo(q(u, 'repo'))),
+  'POST /api/repo/account': (u, b) => accounts.setRepoAccount(checkRepo(b.repo), b.login ? String(b.login) : null),
+  'GET /api/settings': () => ({ claude: claudeAuth.status(), readOnly: READ_ONLY }),
+  'POST /api/settings/claude': (u, b) => ({ claude: claudeAuth.update({ ...(b.method !== undefined && { method: b.method, secret: b.secret }), ...(b.model !== undefined && { model: b.model }) }) }),
+  'POST /api/settings/claude/remove': (u, b) => ({ claude: claudeAuth.remove(b.method) }),
+  'POST /api/settings/claude/test': () => claudeAuth.test({ runAgent: agentPing }),
   'GET /api/repos': () => listRepos(),
   'GET /api/issues': (u) => listIssues(q(u, 'repo'), 'all').then((issues) => ({ columns: COLUMNS, prefix: PREFIX, issues })),
   'GET /api/issue': (u) => getIssue(q(u, 'repo'), Number(q(u, 'number'))),
@@ -669,14 +684,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && await serveBuilt(url.pathname, res)) return;
     json(res, 404, { error: 'not found' });
   } catch (e) {
-    if (!res.headersSent) json(res, 500, { error: String(e.message || e) });
+    if (!res.headersSent) json(res, 500, { error: redact(e.message || e) });
     else res.end();
   }
 });
 
 server.listen(PORT, HOST, () => {
   console.log(`gh-board running at http://localhost:${PORT}`);
-  console.log(process.env.CLAUDE_CODE_OAUTH_TOKEN ? 'Claude auth: CLAUDE_CODE_OAUTH_TOKEN' : 'Claude auth: local `claude login` session (no token in env)');
+  const ca = claudeAuth.status();
+  console.log(`Claude auth: ${ca.label} (${ca.source === 'saved' ? 'chosen in Settings' : ca.source === 'env' ? 'from .env' : 'default'})${ca.billing === 'api' ? ' - billed to the Anthropic API account' : ''}`);
   if (READ_ONLY) console.log('READ_ONLY=1: all writes to GitHub are blocked.');
-  if (process.env.ANTHROPIC_API_KEY) console.warn('! ANTHROPIC_API_KEY is set; it is ignored for the agent so OAuth is used.');
+  if (ca.ambientApiKeyIgnored) console.warn('! ANTHROPIC_API_KEY is set in the shell but not in .env or Settings; it is not used. Add it in Settings to chat on API billing.');
+  accounts.list().then((l) => console.log(l.accounts.length ? `GitHub accounts: ${l.accounts.map((a) => `@${a.login} (${a.sourceLabel})`).join(', ')}` : 'GitHub: no account connected yet.'), () => {});
 });

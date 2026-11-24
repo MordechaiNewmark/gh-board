@@ -1,6 +1,6 @@
 # gh-board
 
-A local board for GitHub issues with a Claude Agent SDK chat that manages it. Works with repos you were **invited to**, because it uses your own GitHub account rather than Claude Desktop's GitHub connection.
+A local board for GitHub issues with a Claude Agent SDK chat that manages it. Works with repos you were **invited to**, because it uses your own GitHub accounts rather than Claude Desktop's GitHub connection. You can connect several GitHub identities at once (personal, work, a client's org) and use all of them in one board.
 
 ## Setup
 
@@ -16,14 +16,43 @@ The UI lives in `web/`: React, Tailwind, shadcn/ui components and assistant-ui f
 
 If the build can't find the chat component, the assistant-ui registry put it somewhere else: fix the one import in `web/src/chat/thread.ts`. For UI work, run `npm start` and `npm run dev:web` together and open http://localhost:5173.
 
-**Claude (OAuth, no API key):** run `claude setup-token` and put the result in `CLAUDE_CODE_OAUTH_TOKEN` in `.env`. Without it the SDK uses your existing `claude login` session. `ANTHROPIC_API_KEY` is ignored on purpose.
+**Claude:** nothing to configure if you have run `claude login` on this computer. To change how the chat signs in, click the gear icon in the header (**Settings > Claude**) and pick one of:
+
+| Method | What you provide | Who pays |
+| --- | --- | --- |
+| Claude login session (default) | Nothing. Uses the `claude login` session on this computer. | Your Claude subscription |
+| OAuth token | The token printed by `claude setup-token` | Your Claude subscription |
+| Anthropic API key | A key from console.anthropic.com | Your Anthropic API account, per token |
+
+The billing difference matters: with an API key, every chat message and repo analysis is charged to the API account, while the other two methods use your Claude subscription. The chat header always shows the active method.
+
+- **Save** stores the key or token on the server only, in `.claude-auth.json` next to the server (owner-readable, git-ignored). It is never sent back to the browser: the UI shows the method and a masked tail such as `••••abcd`. The agent process receives it only as the one environment variable the SDK expects for that method (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`).
+- **Test connection** checks the active method. An API key is validated with a free request that lists models. The login session and the OAuth token have no free check, so the test sends one very short prompt through the Agent SDK.
+- **Remove** forgets a saved key or token.
+- **Model** (same dialog) picks the model for the chat; leave it empty for your account's default.
+- Order of precedence: what you saved in Settings, then `.env` (`CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`), then the login session. An `ANTHROPIC_API_KEY` that is only exported in your shell, and not written in `.env` or saved in Settings, is ignored, so starting the server never moves you onto API billing by accident.
 
 **GitHub:** connect in the UI. Click **Connect GitHub** (it opens by itself on first run) and either:
 
 - paste a classic personal access token with `repo` and `read:org` scopes (the dialog links to GitHub's token page with those scopes ticked). If an org uses SSO, authorize the token for that org; or
 - click **Sign in with GitHub**. This button appears only when `GITHUB_CLIENT_ID` is set: create an OAuth app at github.com/settings/developers, tick "Enable Device Flow", and put its Client ID in `.env`. An org may need to approve the OAuth app before its repos show up.
 
-The token is stored in `.gh-token` next to the server (owner-readable only) and never sent to the browser. `GITHUB_TOKEN` in `.env` or a `gh auth login` session also work as fallbacks. **Disconnect** in the same dialog removes it.
+### Several GitHub accounts
+
+The account button in the header opens the account manager. **Add account** connects another identity next to the ones you have; nothing is replaced. To add a second identity with a token, create the token while signed in to github.com as that account. With **Sign in with GitHub**, switch accounts on github.com first, because GitHub authorizes whichever account the browser is signed in to.
+
+- **Repository list.** It is the merged list of every connected account. With more than one account, each repo shows the avatar of the account used for it, and a filter (**All accounts** / one login) appears under the search box.
+- **Which account is used.** Every request for a repo (issues, labels, milestones, files, board moves, comments, commits, the local checkout for analysis, and the chat's tools) uses the token of the account that can access that repo. If two accounts can open the same repo, the one with the higher permission wins (admin, then write, then read); on a tie, the **default** account. Change the default with **Set as default**.
+- **Attribution.** Whatever you create or change is attributed on GitHub to that account. The issue dialog and the chat header show it as **as @login**. When more than one account can open the repo, that label is a picker, and your choice is remembered for that repo.
+- **Disconnect** removes one account: its token is deleted, its repos leave the list, and local checkouts of repos only it could reach are deleted from `.repo-cache`. The other accounts are not affected.
+- **Adding the same login again** replaces its token (use this to rotate a token).
+- **Expired or revoked token.** That account is marked **Needs attention** (an amber dot on the header button). The other accounts keep working. Add a new token for it to fix it.
+- **SSO.** If an organization requires SSO and the token is not authorized for it, the error names the account and links to GitHub's authorization page.
+- `READ_ONLY=1` blocks writes for every account.
+
+**Where tokens are stored.** Connected accounts live in `.gh-accounts.json` next to the server (owner-readable only, git-ignored): login, avatar URL, token, how it was added, the default account, and your per-repo choices. Tokens are never sent to the browser and never logged. `GITHUB_TOKEN` in `.env` and a `gh auth login` session are picked up as extra accounts when present. They are not copied into the file, and an account with the same login that you added in the app takes their place. If you disconnect one of these, it stays disconnected (with a **Reconnect** button) until you bring it back.
+
+**Upgrading from the single-account version.** Nothing to do. On first start, an existing `.gh-token` is checked with GitHub, moved into `.gh-accounts.json` as your default account, and deleted. If GitHub rejects it, the file is left alone and the dialog tells you. If you were using `GITHUB_TOKEN` or the GitHub CLI, that keeps working as before.
 
 ## What you can do
 
@@ -60,17 +89,21 @@ Every issue body follows one template: Context (with `path:line` references and 
 | What | Where | Notes |
 | --- | --- | --- |
 | Checkouts | `.repo-cache/<owner>/<name>` (git-ignored) | One commit, no history. Delete the folder any time; it is re-created on the next sync. |
-| GitHub token | `.gh-token` / `.env` / `gh` CLI, as before | Never written into the checkout. |
+| GitHub tokens | `.gh-accounts.json` / `.env` / `gh` CLI | Never written into a checkout, sent to the browser, or logged. |
+| Claude key or token | `.claude-auth.json` / `.env` | Only if you choose a method that needs one. Never sent to the browser or logged. |
 | Chat sessions | The Claude Agent SDK's own session store, keyed by checkout folder | Switching repos starts a fresh agent session. |
 
 **Security notes**
 
-- The token is passed to `git` only through environment variables (`GIT_CONFIG_*` with an `http.https://github.com/.extraheader`). It is not in the remote URL, the command line, or `.git/config`, and the credential helper is turned off for these calls.
+- A sync uses the token of the account that owns the repo. It is passed to `git` only through environment variables (`GIT_CONFIG_*` with an `http.https://github.com/.extraheader`). It is not in the remote URL, the command line, or `.git/config`, and the credential helper is turned off for these calls.
 - `git` runs without a shell, with argument arrays. `owner/name` and `ref` are validated strictly, so they cannot escape the cache folder or be read as options. Repo hooks, submodules, symlinks and LFS downloads are disabled.
 - The agent's only built-in tools are `Read`, `Glob` and `Grep`. There is no shell, no file writing, no web access and no subagents. A pre-tool hook resolves every path (following symlinks and junctions) and denies anything outside the selected repo's checkout, plus `.git`, `node_modules`, binaries and files over `ANALYSIS_MAX_FILE_MB`.
 - No settings, `CLAUDE.md`, skills, hooks or MCP config are loaded from the checkout.
 - Repo contents are untrusted input to the model. A hostile file could try to talk the agent into a write. With approvals on, you see and decide every write. **Leave "Auto-approve writes" off when analyzing a repo you do not fully trust.**
-- `READ_ONLY=1` in `.env` blocks every write to GitHub in the server itself (board UI and chat). Use it to try an analysis with no chance of creating anything; the proposal still appears in the chat.
+- `READ_ONLY=1` in `.env` blocks every write to GitHub in the server itself (board UI and chat), for every connected account. Use it to try an analysis with no chance of creating anything; the proposal still appears in the chat.
+- The agent process never receives a GitHub token. GitHub calls run in the server. The only credential the agent gets is the Claude one for the method you chose.
+- `.gh-accounts.json` and `.claude-auth.json` are written with owner-only permissions (mode 600). On Windows that mode has no effect; the files are protected by the access rules of the folder they are in, so keep gh-board inside your user profile. The secrets are not encrypted on disk.
+- Anyone who can open the board can use every connected account and can replace the Claude key. If you expose it beyond localhost (see On a phone), the `ACCESS_KEY` is the only barrier, and a key you paste travels over plain HTTP. Paste secrets from the computer that runs the server.
 - Limits: repos over `ANALYSIS_MAX_MB` (default 300, as reported by GitHub) are refused, and a sync is killed after `ANALYSIS_SYNC_TIMEOUT_S` (default 180).
 
 ## On a phone
@@ -83,4 +116,5 @@ The server is on your computer, so the phone has to reach it. In `.env` set `HOS
 
 - The server only listens on 127.0.0.1 and rejects requests from other sites.
 - The agent has the GitHub tools in `server.mjs` plus read-only `Read` / `Glob` / `Grep` confined to `.repo-cache/<owner>/<name>` of the selected repo: no shell, no writes to disk, and no access to the rest of your disk.
+- `npm test` runs the account and settings tests against a local mock of the GitHub and Anthropic APIs, with fake tokens. It needs no network and writes nothing to GitHub. (`GITHUB_API_URL` and `GH_BOARD_DATA_DIR` exist for these tests; leave them unset otherwise.)
 - Shows up to about 300 open and 40 recently closed issues per repo. Files over 1 MB can't be read through the API.
