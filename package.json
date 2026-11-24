@@ -1,0 +1,20 @@
+{
+  "name": "gh-board",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Kanban board over GitHub issues (including repos you were invited to) with a Claude Agent SDK chat that manages it.",
+  "scripts": {
+    "start": "node server.mjs",
+    "setup": "npm install && npm --prefix web run setup",
+    "build": "npm --prefix web run build",
+    "dev:web": "npm --prefix web run dev"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "zod": "^4.0.0"
+  }
+}

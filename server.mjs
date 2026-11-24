@@ -1,0 +1,575 @@
+import http from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, basename, normalize, extname, sep } from 'node:path';
+import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
+const PORT = Number(process.env.PORT || 3000);
+const PREFIX = process.env.STATUS_PREFIX || 'status:';
+const COLUMNS = (process.env.COLUMNS || 'Backlog,Todo,In progress,Review,Done').split(',').map((s) => s.trim()).filter(Boolean);
+const DONE = COLUMNS[COLUMNS.length - 1];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ------------------------------- GitHub -------------------------------- */
+
+const TOKEN_FILE = join(__dirname, '.gh-token');
+const CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
+let _token, _source, _off = false, device = null;
+
+function ghToken() {
+  if (_off) throw new Error('Not connected to GitHub. Click Connect GitHub.');
+  if (_token) return _token;
+  try { const t = readFileSync(TOKEN_FILE, 'utf8').trim(); if (t) { _source = 'saved in this app'; return (_token = t); } } catch {}
+  if (process.env.GITHUB_TOKEN) { _source = 'GITHUB_TOKEN in .env'; return (_token = process.env.GITHUB_TOKEN); }
+  try { const t = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); _source = 'GitHub CLI'; return (_token = t); }
+  catch { throw new Error('Not connected to GitHub. Click Connect GitHub.'); }
+}
+function setToken(t) { writeFileSync(TOKEN_FILE, t, { mode: 0o600 }); _token = t; _source = 'saved in this app'; _off = false; }
+function clearToken() { try { unlinkSync(TOKEN_FILE); } catch {} _token = undefined; _source = undefined; _off = true; device = null; }
+
+async function authStatus() {
+  const base = { deviceFlow: !!CLIENT_ID, device };
+  try { const u = await gh('/user'); return { ...base, connected: true, login: u.login, avatar: u.avatar_url, source: _source }; }
+  catch (e) { return { ...base, connected: false, error: String(e.message || e) }; }
+}
+async function connectToken(token) {
+  token = String(token || '').trim();
+  if (!token) throw new Error('Paste a token first.');
+  const prev = [_token, _source, _off];
+  _token = token; _off = false;
+  try { await gh('/user'); } catch (e) { [_token, _source, _off] = prev; throw new Error('GitHub rejected that token.'); }
+  setToken(token);
+  return authStatus();
+}
+const ghForm = (url, body) => fetch(url, { method: 'POST', headers: { Accept: 'application/json' }, body: new URLSearchParams(body) }).then((r) => r.json());
+async function deviceStart() {
+  if (!CLIENT_ID) throw new Error('Set GITHUB_CLIENT_ID in .env to use browser sign-in.');
+  const r = await ghForm('https://github.com/login/device/code', { client_id: CLIENT_ID, scope: 'repo read:org' });
+  if (!r.device_code) throw new Error(r.error_description || 'Device flow failed. Enable "Device Flow" on the OAuth app.');
+  device = { status: 'pending' };
+  pollDevice(r.device_code, r.interval || 5, Date.now() + r.expires_in * 1000).catch((e) => { device = { status: 'error', error: String(e.message || e) }; });
+  return { user_code: r.user_code, verification_uri: r.verification_uri };
+}
+async function pollDevice(code, interval, exp) {
+  while (Date.now() < exp) {
+    await sleep(interval * 1000);
+    const r = await ghForm('https://github.com/login/oauth/access_token', { client_id: CLIENT_ID, device_code: code, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }).catch(() => ({}));
+    if (r.access_token) { setToken(r.access_token); device = { status: 'done' }; return; }
+    if (r.error === 'slow_down') interval += 5;
+    else if (r.error && r.error !== 'authorization_pending') { device = { status: 'error', error: r.error_description || r.error }; return; }
+  }
+  device = { status: 'error', error: 'Code expired. Try again.' };
+}
+
+async function gh(path, { method = 'GET', body } = {}) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${ghToken()}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'gh-board',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`GitHub ${res.status} on ${method} ${path}: ${(await res.text()).slice(0, 300)}`);
+  return res.status === 204 ? null : res.json();
+}
+
+async function paged(path, maxPages = 3) {
+  const out = [];
+  for (let p = 1; p <= maxPages; p++) {
+    const page = await gh(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${p}`);
+    out.push(...page);
+    if (page.length < 100) break;
+  }
+  return out;
+}
+
+const checkRepo = (repo) => {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '')) throw new Error('repo must be "owner/name"');
+  return repo;
+};
+const enc = (p) => p.split('/').map(encodeURIComponent).join('/');
+const colFromName = (name) => COLUMNS.find((c) => c.toLowerCase() === String(name).toLowerCase());
+const isStatus = (n) => n.toLowerCase().startsWith(PREFIX.toLowerCase());
+
+function shape(i, full = false) {
+  const labelObjs = i.labels.map((l) => (typeof l === 'string' ? { name: l, color: '888888' } : { name: l.name, color: l.color }));
+  const labels = labelObjs.map((l) => l.name);
+  const status = labels.find(isStatus);
+  let column = status && colFromName(status.slice(PREFIX.length));
+  if (!column) column = i.state === 'closed' ? DONE : COLUMNS[0];
+  return {
+    number: i.number, id: i.id, title: i.title, state: i.state, column, labels, labelObjs,
+    assignees: (i.assignees || []).map((a) => a.login),
+    milestone: i.milestone ? { number: i.milestone.number, title: i.milestone.title } : null,
+    parent: i.parent_issue_url ? Number(i.parent_issue_url.split('/').pop()) : null,
+    sub: i.sub_issues_summary || null,
+    url: i.html_url, comments: i.comments, updated_at: i.updated_at,
+    body: full ? i.body || '' : (i.body || '').slice(0, 300),
+  };
+}
+
+/* ---- repos / issues ---- */
+async function listRepos() {
+  const rs = await paged('/user/repos?sort=pushed&affiliation=owner,collaborator,organization_member', 5);
+  return rs.map((r) => ({ name: r.full_name, private: r.private, issues: r.has_issues, role: r.permissions?.admin ? 'admin' : r.permissions?.push ? 'write' : 'read' }));
+}
+
+async function listIssues(repo, state = 'open', label, milestone) {
+  checkRepo(repo);
+  const f = `${label ? `&labels=${encodeURIComponent(label)}` : ''}${milestone ? `&milestone=${milestone}` : ''}`;
+  const raw = [];
+  if (state === 'open' || state === 'all') raw.push(...(await paged(`/repos/${repo}/issues?state=open&sort=updated${f}`, 3)));
+  if (state === 'closed' || state === 'all') raw.push(...(await gh(`/repos/${repo}/issues?state=closed&sort=updated&per_page=40${f}`)));
+  return raw.filter((i) => !i.pull_request).map((i) => shape(i));
+}
+
+async function listSubIssues(repo, number) {
+  checkRepo(repo);
+  return (await gh(`/repos/${repo}/issues/${number}/sub_issues?per_page=100`)).map((i) => shape(i));
+}
+
+async function getIssue(repo, number) {
+  checkRepo(repo);
+  const [i, comments, subs] = await Promise.all([
+    gh(`/repos/${repo}/issues/${number}`),
+    gh(`/repos/${repo}/issues/${number}/comments?per_page=30`),
+    gh(`/repos/${repo}/issues/${number}/sub_issues?per_page=100`).catch(() => []),
+  ]);
+  return {
+    ...shape(i, true),
+    sub_issues: subs.map((s) => shape(s)),
+    comment_list: comments.map((c) => ({ by: c.user.login, at: c.created_at, body: c.body.slice(0, 2000) })),
+  };
+}
+
+async function moveIssue(repo, number, columnName) {
+  checkRepo(repo);
+  const column = colFromName(columnName);
+  if (!column) throw new Error(`Unknown column "${columnName}". Columns: ${COLUMNS.join(', ')}`);
+  const i = await gh(`/repos/${repo}/issues/${number}`);
+  for (const n of i.labels.map((l) => l.name).filter(isStatus)) {
+    await gh(`/repos/${repo}/issues/${number}/labels/${encodeURIComponent(n)}`, { method: 'DELETE' }).catch(() => {});
+  }
+  await gh(`/repos/${repo}/issues/${number}/labels`, { method: 'POST', body: { labels: [PREFIX + column] } });
+  const wantClosed = column === DONE;
+  if ((i.state === 'closed') !== wantClosed) await gh(`/repos/${repo}/issues/${number}`, { method: 'PATCH', body: { state: wantClosed ? 'closed' : 'open' } });
+  return { number, column };
+}
+
+async function setParent(repo, number, parent) {
+  checkRepo(repo);
+  const child = await gh(`/repos/${repo}/issues/${number}`);
+  if (parent == null) {
+    const p = child.parent_issue_url?.split('/').pop();
+    if (!p) return { number, parent: null };
+    await gh(`/repos/${repo}/issues/${p}/sub_issue`, { method: 'DELETE', body: { sub_issue_id: child.id } });
+    return { number, parent: null };
+  }
+  await gh(`/repos/${repo}/issues/${parent}/sub_issues`, { method: 'POST', body: { sub_issue_id: child.id, replace_parent: true } });
+  return { number, parent };
+}
+
+async function createIssue(repo, { title, body, labels = [], assignees = [], column, milestone, parent_number }) {
+  checkRepo(repo);
+  const col = column ? colFromName(column) : undefined;
+  if (column && !col) throw new Error(`Unknown column "${column}"`);
+  const i = await gh(`/repos/${repo}/issues`, {
+    method: 'POST',
+    body: { title, body, labels: col ? [...labels, PREFIX + col] : labels, assignees, ...(milestone ? { milestone } : {}) },
+  });
+  if (col === DONE) await gh(`/repos/${repo}/issues/${i.number}`, { method: 'PATCH', body: { state: 'closed' } });
+  if (parent_number) await setParent(repo, i.number, parent_number);
+  return shape(i);
+}
+
+async function createTree(repo, items, parent) {
+  const out = [];
+  for (const { children, ...it } of items) {
+    const made = await createIssue(repo, { ...it, parent_number: parent });
+    await sleep(250);
+    out.push({ number: made.number, title: made.title, children: children?.length ? await createTree(repo, children, made.number) : [] });
+  }
+  return out;
+}
+
+async function updateIssue(repo, number, { title, body, assignees, add_labels, remove_labels, state, milestone }) {
+  checkRepo(repo);
+  const patch = {};
+  if (title !== undefined) patch.title = title;
+  if (body !== undefined) patch.body = body;
+  if (assignees !== undefined) patch.assignees = assignees;
+  if (state !== undefined) patch.state = state;
+  if (milestone !== undefined) patch.milestone = milestone;
+  if (Object.keys(patch).length) await gh(`/repos/${repo}/issues/${number}`, { method: 'PATCH', body: patch });
+  if (add_labels?.length) await gh(`/repos/${repo}/issues/${number}/labels`, { method: 'POST', body: { labels: add_labels } });
+  for (const l of remove_labels || []) await gh(`/repos/${repo}/issues/${number}/labels/${encodeURIComponent(l)}`, { method: 'DELETE' }).catch(() => {});
+  return shape(await gh(`/repos/${repo}/issues/${number}`));
+}
+
+async function commentIssue(repo, number, body) {
+  checkRepo(repo);
+  return { url: (await gh(`/repos/${repo}/issues/${number}/comments`, { method: 'POST', body: { body } })).html_url };
+}
+
+async function deleteIssue(repo, number) {
+  checkRepo(repo);
+  const i = await gh(`/repos/${repo}/issues/${number}`);
+  const r = await gh('/graphql', { method: 'POST', body: { query: `mutation{deleteIssue(input:{issueId:"${i.node_id}"}){clientMutationId}}` } });
+  if (r.errors?.length) throw new Error(`Delete failed: ${r.errors[0].message} (deleting needs admin rights; close it instead)`);
+  return { deleted: number };
+}
+
+/* ---- labels / milestones / people ---- */
+const listLabels = async (repo) => (await paged(`/repos/${checkRepo(repo)}/labels`, 3)).map((l) => ({ name: l.name, color: l.color, description: l.description }));
+const createLabel = (repo, { name, color = 'ededed', description = '' }) => gh(`/repos/${checkRepo(repo)}/labels`, { method: 'POST', body: { name, color: color.replace('#', ''), description } }).then((l) => ({ name: l.name, color: l.color }));
+const updateLabel = (repo, { name, new_name, color, description }) => gh(`/repos/${checkRepo(repo)}/labels/${encodeURIComponent(name)}`, { method: 'PATCH', body: { ...(new_name && { new_name }), ...(color && { color: color.replace('#', '') }), ...(description !== undefined && { description }) } }).then((l) => ({ name: l.name, color: l.color }));
+const deleteLabel = (repo, name) => gh(`/repos/${checkRepo(repo)}/labels/${encodeURIComponent(name)}`, { method: 'DELETE' }).then(() => ({ deleted: name }));
+const listMilestones = async (repo) => (await gh(`/repos/${checkRepo(repo)}/milestones?state=all&per_page=50`)).map((m) => ({ number: m.number, title: m.title, state: m.state, due_on: m.due_on, open: m.open_issues, closed: m.closed_issues }));
+const createMilestone = (repo, b) => gh(`/repos/${checkRepo(repo)}/milestones`, { method: 'POST', body: b }).then((m) => ({ number: m.number, title: m.title }));
+const updateMilestone = (repo, { number, ...b }) => gh(`/repos/${checkRepo(repo)}/milestones/${number}`, { method: 'PATCH', body: b }).then((m) => ({ number: m.number, title: m.title, state: m.state }));
+const listAssignees = async (repo) => (await paged(`/repos/${checkRepo(repo)}/assignees`, 2)).map((u) => u.login);
+
+/* ---- code ---- */
+async function listTree(repo, path = '', ref) {
+  checkRepo(repo);
+  const r = await gh(`/repos/${repo}/contents/${enc(path)}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`);
+  if (!Array.isArray(r)) return [{ name: r.name, path: r.path, type: r.type, size: r.size }];
+  return r.map((e) => ({ name: e.name, path: e.path, type: e.type, size: e.size })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
+}
+
+async function readFileGH(repo, path, ref) {
+  checkRepo(repo);
+  const r = await gh(`/repos/${repo}/contents/${enc(path)}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`);
+  if (Array.isArray(r)) throw new Error(`${path} is a directory`);
+  if (!r.content) throw new Error(`${path} is too large to read through the API (${r.size} bytes)`);
+  const text = Buffer.from(r.content, 'base64').toString('utf8');
+  return { path: r.path, size: r.size, url: r.html_url, truncated: text.length > 60000, content: text.slice(0, 60000) };
+}
+
+async function searchCode(repo, q) {
+  checkRepo(repo);
+  const r = await gh(`/search/code?q=${encodeURIComponent(`${q} repo:${repo}`)}&per_page=20`);
+  return r.items.map((i) => ({ path: i.path, url: i.html_url }));
+}
+
+async function commitFile(repo, { path, content, message, branch }) {
+  checkRepo(repo);
+  if (branch) {
+    const have = await gh(`/repos/${repo}/git/ref/heads/${enc(branch)}`).catch(() => null);
+    if (!have) {
+      const def = (await gh(`/repos/${repo}`)).default_branch;
+      const base = await gh(`/repos/${repo}/git/ref/heads/${enc(def)}`);
+      await gh(`/repos/${repo}/git/refs`, { method: 'POST', body: { ref: `refs/heads/${branch}`, sha: base.object.sha } });
+    }
+  }
+  const existing = await gh(`/repos/${repo}/contents/${enc(path)}${branch ? `?ref=${encodeURIComponent(branch)}` : ''}`).catch(() => null);
+  const r = await gh(`/repos/${repo}/contents/${enc(path)}`, {
+    method: 'PUT',
+    body: { message: message || `Add ${path}`, content: Buffer.from(content).toString('base64'), ...(branch && { branch }), ...(existing?.sha && { sha: existing.sha }) },
+  });
+  return { path, branch: branch || 'default', url: r.content.html_url };
+}
+
+/* ---- per-chat file context ---- */
+const downloads = new Map();
+const chatFiles = new Map(); // chatId -> { uploads, generated }
+function filesFor(chatId) {
+  const id = String(chatId || 'default').slice(0, 64);
+  if (!chatFiles.has(id)) { chatFiles.set(id, { uploads: new Map(), generated: new Map() }); if (chatFiles.size > 20) chatFiles.delete(chatFiles.keys().next().value); }
+  return chatFiles.get(id);
+}
+setInterval(() => { const n = Date.now(); for (const [k, v] of downloads) if (v.exp < n) downloads.delete(k); }, 60000).unref();
+
+const isTextName = (n) => /\.(md|txt|csv|tsv|json|ya?ml|toml|xml|html?|css|js|mjs|cjs|jsx|tsx?|py|rb|go|rs|java|kt|swift|c|h|cpp|cs|php|sh|sql|log|env|ini|cfg)$/i.test(n);
+const looksText = (buf) => buf.length < 400000 && !buf.includes(0);
+
+function findFile(ctx, name) {
+  return ctx.uploads.get(name) || ctx.generated.get(name) || null;
+}
+
+async function attachToIssue(ctx, repo, number, filename, note) {
+  const f = findFile(ctx, filename);
+  if (!f) throw new Error(`No uploaded or generated file named "${filename}". Known: ${[...ctx.uploads.keys(), ...ctx.generated.keys()].join(', ') || 'none'}`);
+  if (looksText(f.buf) && f.buf.length <= 15000) {
+    const out = await commentIssue(repo, number, `${note ? note + '\n\n' : ''}<details><summary>Attachment: ${filename}</summary>\n\n~~~~\n${f.buf.toString('utf8')}\n~~~~\n</details>`);
+    return { mode: 'comment', ...out };
+  }
+  const saved = await commitFile(repo, { path: `attachments/${number}/${filename}`, content: f.buf, message: `Attach ${filename} to #${number}`, branch: 'board-attachments' });
+  const out = await commentIssue(repo, number, `${note ? note + '\n\n' : ''}Attachment: [${filename}](${saved.url}) (branch \`board-attachments\`)`);
+  return { mode: 'committed', file: saved.url, ...out };
+}
+
+function generateFile(ctx, filename, content) {
+  const name = basename(filename).replace(/[^\w.\- ]/g, '_') || 'file.txt';
+  const buf = Buffer.from(content, 'utf8');
+  ctx.generated.set(name, { buf, type: 'text/plain' });
+  const id = randomUUID();
+  downloads.set(id, { name, buf, exp: Date.now() + 3600e3 });
+  ctx.send({ type: 'file', id, name, size: buf.length });
+  return { saved: name, bytes: buf.length, note: 'Shown to the user as a download. Use attach_to_issue or commit_file to place it in the repo.' };
+}
+
+/* ----------------------------- Agent tools ------------------------------ */
+
+const ok = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data) }] });
+const T = (name, desc, shapeDef, fn) => tool(name, desc, shapeDef, async (args) => {
+  try { return ok(await fn(args)); } catch (e) { return { isError: true, content: [{ type: 'text', text: String(e.message || e) }] }; }
+});
+
+const issueIn = {
+  title: z.string(), body: z.string().optional(), labels: z.array(z.string()).optional(),
+  assignees: z.array(z.string()).optional(), column: z.string().optional(), milestone: z.number().optional(),
+};
+const R = z.string().describe('owner/name');
+
+const READ_NAMES = ['list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file'];
+
+function makeServer(ctx) {
+  return createSdkMcpServer({
+    name: 'gh', version: '2.0.0',
+    tools: [
+      T('list_repos', 'Repos the user can access, including ones they were invited to.', {}, () => listRepos()),
+      T('list_issues', 'Issues with board column, labels, parent and sub-issue progress.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional() }, (a) => listIssues(a.repo, a.state, a.label, a.milestone)),
+      T('get_issue', 'One issue: full body, comments, parent and sub-issues.', { repo: R, number: z.number() }, (a) => getIssue(a.repo, a.number)),
+      T('list_sub_issues', 'Children of an issue.', { repo: R, number: z.number() }, (a) => listSubIssues(a.repo, a.number)),
+      T('create_issue', 'Create one issue; optional column, labels, assignees, milestone number and parent_number (makes it a sub-issue).', { repo: R, ...issueIn, parent_number: z.number().optional() }, ({ repo, ...r }) => createIssue(repo, r)),
+      T('create_issues', 'Create a hierarchy in one call: epics with children (sub-issues). Use for imports from specs/files.', { repo: R, issues: z.array(z.object({ ...issueIn, children: z.array(z.object(issueIn)).optional() })), parent_number: z.number().optional() }, (a) => createTree(a.repo, a.issues, a.parent_number)),
+      T('update_issue', 'Edit title/body/assignees/labels/milestone (number, or null to clear)/state.', { repo: R, number: z.number(), title: z.string().optional(), body: z.string().optional(), assignees: z.array(z.string()).optional(), add_labels: z.array(z.string()).optional(), remove_labels: z.array(z.string()).optional(), milestone: z.number().nullable().optional(), state: z.enum(['open', 'closed']).optional() }, ({ repo, number, ...r }) => updateIssue(repo, number, r)),
+      T('move_issue', `Move to a board column: ${COLUMNS.join(', ')}.`, { repo: R, number: z.number(), column: z.string() }, (a) => moveIssue(a.repo, a.number, a.column)),
+      T('set_parent', 'Make an issue a sub-issue of parent_number, or detach it (parent_number null).', { repo: R, number: z.number(), parent_number: z.number().nullable() }, (a) => setParent(a.repo, a.number, a.parent_number)),
+      T('comment_issue', 'Comment on an issue.', { repo: R, number: z.number(), body: z.string() }, (a) => commentIssue(a.repo, a.number, a.body)),
+      T('delete_issue', 'Permanently delete an issue (needs admin). Prefer closing.', { repo: R, number: z.number() }, (a) => deleteIssue(a.repo, a.number)),
+      T('list_labels', 'Labels in the repo.', { repo: R }, (a) => listLabels(a.repo)),
+      T('create_label', 'Create a label (color hex without #).', { repo: R, name: z.string(), color: z.string().optional(), description: z.string().optional() }, ({ repo, ...r }) => createLabel(repo, r)),
+      T('update_label', 'Rename/recolor a label.', { repo: R, name: z.string(), new_name: z.string().optional(), color: z.string().optional(), description: z.string().optional() }, ({ repo, ...r }) => updateLabel(repo, r)),
+      T('delete_label', 'Delete a label.', { repo: R, name: z.string() }, (a) => deleteLabel(a.repo, a.name)),
+      T('list_milestones', 'Milestones with progress.', { repo: R }, (a) => listMilestones(a.repo)),
+      T('create_milestone', 'Create a milestone.', { repo: R, title: z.string(), description: z.string().optional(), due_on: z.string().optional().describe('ISO 8601') }, ({ repo, ...r }) => createMilestone(repo, r)),
+      T('update_milestone', 'Edit or close a milestone.', { repo: R, number: z.number(), title: z.string().optional(), description: z.string().optional(), due_on: z.string().optional(), state: z.enum(['open', 'closed']).optional() }, ({ repo, ...r }) => updateMilestone(repo, r)),
+      T('list_assignees', 'Logins that can be assigned.', { repo: R }, (a) => listAssignees(a.repo)),
+      T('list_tree', 'List a directory of the repo (path "" = root).', { repo: R, path: z.string().default(''), ref: z.string().optional() }, (a) => listTree(a.repo, a.path, a.ref)),
+      T('read_file', 'Read a source file from the repo.', { repo: R, path: z.string(), ref: z.string().optional() }, (a) => readFileGH(a.repo, a.path, a.ref)),
+      T('search_code', 'Search code in the repo.', { repo: R, q: z.string() }, (a) => searchCode(a.repo, a.q)),
+      T('generate_file', 'Create a file (spec, CSV export, report, markdown) and offer it to the user as a download.', { filename: z.string(), content: z.string() }, (a) => generateFile(ctx, a.filename, a.content)),
+      T('attach_to_issue', 'Attach an uploaded or generated file to an issue: small text goes in a comment, anything else is committed to branch board-attachments and linked.', { repo: R, number: z.number(), filename: z.string(), note: z.string().optional() }, (a) => attachToIssue(ctx, a.repo, a.number, a.filename, a.note)),
+      T('commit_file', 'Commit a file to the repo from inline content or an uploaded/generated file name. Prefer a new branch.', { repo: R, path: z.string(), content: z.string().optional(), from_file: z.string().optional(), message: z.string().optional(), branch: z.string().optional() }, async (a) => {
+        let content = a.content;
+        if (a.from_file) { const f = findFile(ctx, a.from_file); if (!f) throw new Error(`No file named ${a.from_file}`); content = f.buf; }
+        if (content === undefined) throw new Error('Provide content or from_file');
+        return commitFile(a.repo, { path: a.path, content, message: a.message, branch: a.branch });
+      }),
+    ],
+  });
+}
+
+const READ_TOOLS = READ_NAMES.map((t) => `mcp__gh__${t}`);
+const pending = new Map();
+
+function systemPrompt(repo) {
+  return `You manage a GitHub issues kanban board for the user and can read the repo's code.
+Current repo: ${repo || '(none selected - ask or use list_repos)'}.
+Board columns, in order: ${COLUMNS.join(' | ')}. A column is the label "${PREFIX}<Column>"; the last column means closed.
+Hierarchy: GitHub sub-issues. Use create_issues for epics with children, set_parent to restructure, and parent_number on create_issue.
+Code: use list_tree, read_file and search_code to ground issues in real files and paths. Quote paths in issue bodies.
+Files: the user may attach files; their text is in the message. To produce deliverables (specs, CSV exports, reports) use generate_file. To put a file in an issue use attach_to_issue; to put it in the repo use commit_file on a new branch.
+Check list_labels / list_milestones before creating issues so you reuse existing labels; create missing labels with create_label.
+Be concise. Read before changing anything. For bulk work, state the plan as a short list, then make the calls. Write actions need the user's approval in the UI; if one is rejected, don't retry it. Never invent issue numbers.`;
+}
+
+/* -------------------------------- HTTP --------------------------------- */
+
+const json = (res, code, data) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); };
+const readBody = (req, max = 30e6) => new Promise((resolve, reject) => {
+  const parts = []; let n = 0;
+  req.on('data', (c) => { n += c.length; if (n > max) { reject(new Error('Request too large')); req.destroy(); } else parts.push(c); });
+  req.on('end', () => { try { const s = Buffer.concat(parts).toString('utf8'); resolve(s ? JSON.parse(s) : {}); } catch (e) { reject(e); } });
+});
+
+const trunc = (v) => typeof v === 'string' ? (v.length > 400 ? `${v.slice(0, 400)}... (+${v.length - 400} chars)` : v)
+  : Array.isArray(v) ? v.map(trunc) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, trunc(x)])) : v;
+
+function buildPrompt(message, files, uploads) {
+  let text = message || '';
+  const images = [];
+  for (const f of files || []) {
+    const buf = Buffer.from(f.b64 || '', 'base64');
+    const name = basename(f.name || 'file');
+    uploads.set(name, { buf, type: f.type || '' });
+    if (/^image\/(png|jpe?g|gif|webp)$/.test(f.type) && buf.length < 4e6) {
+      images.push({ type: 'image', source: { type: 'base64', media_type: f.type, data: f.b64 } });
+      text += `\n\n[Attached image: ${name}]`;
+    } else if ((isTextName(name) || (f.type || '').startsWith('text/')) && looksText(buf)) {
+      const s = buf.toString('utf8');
+      text += `\n\n[Attached file: ${name} (${buf.length} bytes)]\n~~~~\n${s.slice(0, 50000)}\n~~~~${s.length > 50000 ? '\n(truncated at 50000 characters)' : ''}`;
+    } else {
+      text += `\n\n[Attached binary file: ${name} (${buf.length} bytes) - cannot be read, but can be attached or committed by name]`;
+    }
+  }
+  return [{ type: 'text', text: text || 'See the attached files.' }, ...images];
+}
+
+async function chat(req, res) {
+  const { message, repo, sessionId, autoApprove, files, chatId } = await readBody(req);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  const send = (o) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(o)}\n\n`); };
+  const abort = new AbortController();
+  const mine = new Set();
+  res.on('close', () => { abort.abort(); for (const id of mine) { pending.get(id)?.(false); pending.delete(id); } });
+
+  const ctx = { ...filesFor(chatId), send };
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+
+  let finish;
+  const finished = new Promise((r) => (finish = r));
+  const content = buildPrompt(message, files, ctx.uploads);
+  async function* input() {
+    yield { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: sessionId || '' };
+    await finished;
+  }
+
+  try {
+    const q = query({
+      prompt: input(),
+      options: {
+        abortController: abort, env,
+        model: process.env.CLAUDE_MODEL || undefined,
+        resume: sessionId || undefined,
+        systemPrompt: systemPrompt(repo),
+        mcpServers: { gh: makeServer(ctx) },
+        allowedTools: READ_TOOLS,
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit'],
+        settingSources: [],
+        maxTurns: 60,
+        canUseTool: async (toolName, inp, opts) => {
+          if (!toolName.startsWith('mcp__gh__')) return { behavior: 'deny', message: 'Tool not available.' };
+          if (autoApprove) return { behavior: 'allow', updatedInput: inp };
+          const id = randomUUID();
+          mine.add(id);
+          send({ type: 'approval', id, toolUseId: opts?.toolUseID, tool: toolName.replace('mcp__gh__', ''), input: trunc(inp) });
+          const approved = await new Promise((r) => pending.set(id, r));
+          pending.delete(id); mine.delete(id);
+          return approved ? { behavior: 'allow', updatedInput: inp } : { behavior: 'deny', message: 'The user rejected this action.' };
+        },
+      },
+    });
+    for await (const m of q) {
+      if (m.type === 'system' && m.subtype === 'init') send({ type: 'session', sessionId: m.session_id });
+      else if (m.type === 'assistant') {
+        for (const b of m.message.content) {
+          if (b.type === 'text' && b.text.trim()) send({ type: 'text', text: b.text });
+          else if (b.type === 'tool_use') send({ type: 'tool', id: b.id, name: b.name.replace('mcp__gh__', ''), input: trunc(b.input) });
+        }
+      } else if (m.type === 'user' && Array.isArray(m.message?.content)) {
+        for (const b of m.message.content) if (b.type === 'tool_result') send({ type: 'tool_result', id: b.tool_use_id, isError: !!b.is_error });
+      } else if (m.type === 'result') { send({ type: 'done', error: m.is_error ? (m.result || m.subtype) : undefined }); finish(); }
+    }
+  } catch (e) {
+    if (!abort.signal.aborted) send({ type: 'error', error: String(e.message || e) });
+  } finally { finish(); }
+  res.end();
+}
+
+const q = (url, k) => url.searchParams.get(k);
+const routes = {
+  'GET /api/auth/status': () => authStatus(),
+  'POST /api/auth/token': (u, b) => connectToken(b.token),
+  'POST /api/auth/device': () => deviceStart(),
+  'POST /api/auth/logout': () => { clearToken(); return { connected: false }; },
+  'GET /api/repos': () => listRepos(),
+  'GET /api/issues': (u) => listIssues(q(u, 'repo'), 'all').then((issues) => ({ columns: COLUMNS, prefix: PREFIX, issues })),
+  'GET /api/issue': (u) => getIssue(q(u, 'repo'), Number(q(u, 'number'))),
+  'GET /api/labels': (u) => listLabels(q(u, 'repo')),
+  'GET /api/milestones': (u) => listMilestones(q(u, 'repo')),
+  'GET /api/assignees': (u) => listAssignees(q(u, 'repo')),
+  'GET /api/tree': (u) => listTree(q(u, 'repo'), q(u, 'path') || ''),
+  'GET /api/file': (u) => readFileGH(q(u, 'repo'), q(u, 'path')),
+  'POST /api/move': (u, b) => moveIssue(b.repo, b.number, b.column),
+  'POST /api/issue/create': (u, b) => createIssue(b.repo, b),
+  'POST /api/issue/update': (u, b) => updateIssue(b.repo, b.number, b),
+  'POST /api/issue/parent': (u, b) => setParent(b.repo, b.number, b.parent ?? null),
+  'POST /api/issue/comment': (u, b) => commentIssue(b.repo, b.number, b.body),
+  'POST /api/label/create': (u, b) => createLabel(b.repo, b),
+};
+
+const DIST = join(__dirname, 'web', 'dist');
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.woff2': 'font/woff2', '.map': 'application/json' };
+// Serves the built React UI (web/dist). Returns false when the file is missing.
+async function serveBuilt(pathname, res) {
+  const file = join(DIST, normalize(pathname).replace(/^[/\\]+/, ''));
+  if (file !== DIST && !file.startsWith(DIST + sep)) return false;
+  try {
+    const buf = await readFile(file);
+    res.writeHead(200, { 'Content-Type': MIME[extname(file)] || 'application/octet-stream' });
+    res.end(buf);
+    return true;
+  } catch { return false; }
+}
+
+const HOST = process.env.HOST || '127.0.0.1';
+const KEY = process.env.ACCESS_KEY || '';
+const LOCAL = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, ...(process.env.ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean)]);
+const sha = (v) => createHash('sha256').update(String(v)).digest();
+const keyOk = (v) => !!v && timingSafeEqual(sha(v), sha(KEY));
+if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) && KEY.length < 12) {
+  console.error('HOST is not loopback: set ACCESS_KEY (12+ characters) in .env so only you can open the board.');
+  process.exit(1);
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const key = `${req.method} ${url.pathname}`;
+  const origin = req.headers.origin;
+  if (!LOCAL.has(req.headers.host) || (origin && !LOCAL.has(origin.replace(/^https?:\/\//, '')))) return json(res, 403, { error: 'Requests are only accepted from this app on localhost.' });
+  if (KEY) {
+    const given = url.searchParams.get('key');
+    if (given && keyOk(given)) {
+      res.writeHead(302, { 'Set-Cookie': `ghb=${encodeURIComponent(given)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`, Location: '/' });
+      return res.end();
+    }
+    const cookie = /(?:^|;\s*)ghb=([^;]+)/.exec(req.headers.cookie || '')?.[1];
+    let val = ''; try { val = decodeURIComponent(cookie || ''); } catch {}
+    if (!keyOk(val)) { res.writeHead(401, { 'Content-Type': 'text/plain' }); return res.end('Locked. Open this address once with ?key=YOUR_ACCESS_KEY'); }
+  }
+  try {
+    if (key === 'GET /') {
+      if (await serveBuilt('/index.html', res)) return;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(await readFile(join(__dirname, 'public', 'index.html')));
+    }
+    if (key === 'GET /api/download') {
+      const d = downloads.get(q(url, 'id'));
+      if (!d) return json(res, 404, { error: 'expired' });
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${d.name}"` });
+      return res.end(d.buf);
+    }
+    if (key === 'POST /api/approve') {
+      const { id, ok: approved } = await readBody(req);
+      pending.get(id)?.(!!approved);
+      return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /api/chat') return await chat(req, res);
+    if (routes[key]) return json(res, 200, await routes[key](url, req.method === 'POST' ? await readBody(req) : undefined));
+    if (req.method === 'GET' && !url.pathname.startsWith('/api/') && await serveBuilt(url.pathname, res)) return;
+    json(res, 404, { error: 'not found' });
+  } catch (e) {
+    if (!res.headersSent) json(res, 500, { error: String(e.message || e) });
+    else res.end();
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`gh-board running at http://localhost:${PORT}`);
+  console.log(process.env.CLAUDE_CODE_OAUTH_TOKEN ? 'Claude auth: CLAUDE_CODE_OAUTH_TOKEN' : 'Claude auth: local `claude login` session (no token in env)');
+  if (process.env.ANTHROPIC_API_KEY) console.warn('! ANTHROPIC_API_KEY is set; it is ignored for the agent so OAuth is used.');
+});

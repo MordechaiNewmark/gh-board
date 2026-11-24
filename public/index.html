@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gh-board</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { --bg:#F6F5F2; --panel:#FFFFFF; --side:#FBFAF8; --col:#ECEAE4; --line:#E6E4DE; --line2:#D9D6CE; --text:#1C1B19; --mute:#5F5C54; --acc:#C4552D; --ok:#1F6B3F; --bad:#8F2F12; --mono:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg); color:var(--text); font:14px/1.45 Inter,system-ui,sans-serif; }
+  input, select, textarea, button { font:inherit; color:var(--text); }
+  input, select, textarea { background:#fff; border:1px solid var(--line2); border-radius:8px; padding:7px 10px; }
+  textarea { width:100%; resize:vertical; }
+  button { background:#fff; border:1px solid var(--line2); border-radius:8px; padding:7px 13px; cursor:pointer; font-weight:500; }
+  button:hover { border-color:var(--mute); }
+  button.primary { background:var(--text); border-color:var(--text); color:#fff; }
+  button.accent { background:var(--acc); border-color:var(--acc); color:#fff; }
+  button.link { border:0; background:none; padding:0; color:var(--acc); }
+  button:disabled { opacity:.5; cursor:default; }
+  :focus-visible { outline:2px solid #2F6FDE; outline-offset:2px; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:10px 20px; background:var(--panel); border-bottom:1px solid var(--line); }
+  .logo { display:flex; align-items:center; gap:9px; font-weight:600; font-size:15px; }
+  .logo i { width:20px; height:20px; border-radius:6px; background:var(--acc); }
+  .tabs { display:flex; gap:2px; background:var(--col); border-radius:9px; padding:3px; }
+  .tabs button { border:0; background:none; padding:5px 13px; border-radius:7px; }
+  .tabs button.on { background:#fff; }
+  #filter { width:210px; }
+  #acct { margin-left:auto; display:flex; align-items:center; gap:8px; }
+  #acct img { width:20px; height:20px; border-radius:50%; }
+  .wrap { flex:1; display:flex; min-height:0; }
+  nav { width:230px; flex:none; background:var(--side); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  nav input { margin:12px; }
+  #repoList { overflow-y:auto; padding:0 8px 12px; }
+  .repo { display:flex; justify-content:space-between; gap:8px; width:100%; text-align:left; border:0; background:none; padding:7px 10px; font:12.5px var(--mono); font-weight:400; }
+  .repo span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .repo small { font:11px Inter,system-ui,sans-serif; color:var(--mute); }
+  .repo.on { background:var(--col); }
+  main { flex:1; min-width:0; overflow:auto; padding:16px 20px; }
+  #status { color:var(--mute); font-size:12.5px; min-height:20px; margin-bottom:8px; }
+  #status.err { color:var(--bad); }
+  .board { display:flex; gap:12px; align-items:flex-start; }
+  .col { flex:1 0 230px; min-width:230px; background:var(--col); border-radius:12px; padding:10px; }
+  .col.over { outline:2px solid var(--acc); }
+  .col h2 { display:flex; justify-content:space-between; font-size:12.5px; margin:2px 4px 10px; }
+  .col h2 span { font-weight:400; color:var(--mute); background:var(--bg); border-radius:10px; padding:0 8px; }
+  .cards { min-height:40px; display:flex; flex-direction:column; gap:8px; }
+  .card { background:#fff; border:1px solid #E0DDD5; border-radius:10px; padding:10px 12px; cursor:pointer; }
+  .card:hover { border-color:var(--mute); }
+  .num { font:12px var(--mono); color:var(--mute); }
+  .card .t { font-weight:500; margin-top:2px; }
+  .meta { display:flex; flex-wrap:wrap; gap:5px; align-items:center; margin-top:8px; }
+  .chip { font-size:11px; font-weight:500; padding:1px 8px; border-radius:10px; border:1px solid var(--line2); background:var(--bg); white-space:nowrap; }
+  .chip.off { opacity:.45; }
+  button.chip { cursor:pointer; }
+  .who { font-size:12px; color:var(--mute); }
+  .tree .row { display:flex; align-items:center; gap:10px; padding:7px 10px; border-bottom:1px solid var(--line); background:#fff; cursor:pointer; }
+  .tree .row:hover { background:var(--side); }
+  .tree .row .t { flex:1; min-width:0; }
+  .tree .row.closed .t { color:var(--mute); text-decoration:line-through; }
+  .code { display:flex; gap:14px; align-items:flex-start; }
+  .files { width:270px; flex:none; background:#fff; border:1px solid var(--line); border-radius:10px; padding:8px; font:12.5px var(--mono); max-height:calc(100vh - 150px); overflow:auto; }
+  .f { display:block; width:100%; text-align:left; border:0; background:none; padding:3px 6px; font:inherit; font-weight:400; white-space:pre; }
+  .f.on { background:var(--col); }
+  .viewer { flex:1; min-width:0; background:#fff; border:1px solid var(--line); border-radius:10px; }
+  .viewer .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:9px 12px; border-bottom:1px solid var(--line); font:12.5px var(--mono); }
+  .viewer pre { margin:0; padding:12px; overflow:auto; font:12.5px/1.5 var(--mono); max-height:calc(100vh - 200px); }
+  aside { width:390px; flex:none; background:var(--panel); border-left:1px solid var(--line); display:flex; flex-direction:column; }
+  aside.drop { outline:2px dashed var(--acc); outline-offset:-6px; }
+  .ah { padding:13px 18px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; font-weight:600; }
+  .ah label { font-weight:400; font-size:12px; color:var(--mute); display:flex; gap:5px; align-items:center; }
+  #log { flex:1; overflow-y:auto; padding:14px 18px; display:flex; flex-direction:column; gap:12px; }
+  .msg { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.me { align-self:flex-end; max-width:88%; background:#F0EEE8; border-radius:12px 12px 2px 12px; padding:9px 13px; }
+  .msg.tool { font:12px var(--mono); color:var(--mute); }
+  .msg.err { color:var(--bad); }
+  .box { border:1px solid var(--line2); border-radius:10px; padding:11px 13px; }
+  .box pre { margin:6px 0 10px; padding:8px 10px; background:var(--bg); border-radius:6px; font:12px var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow:auto; }
+  .box b { font-size:12px; color:var(--mute); }
+  #pend { display:flex; flex-wrap:wrap; gap:6px; padding:0 14px; }
+  #pend:not(:empty) { padding-top:10px; }
+  #form { display:flex; gap:8px; padding:12px 14px; border-top:1px solid var(--line); align-items:flex-end; }
+  #msg { flex:1; min-height:38px; max-height:140px; }
+  .clip { border:1px solid var(--line2); border-radius:8px; padding:7px 10px; cursor:pointer; }
+  dialog { border:1px solid var(--line2); border-radius:14px; padding:0; width:min(720px,94vw); color:var(--text); }
+  dialog::backdrop { background:rgba(28,27,25,.4); }
+  .dh { display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid var(--line); font-weight:600; }
+  .db { padding:16px 20px; display:flex; flex-direction:column; gap:12px; max-height:72vh; overflow:auto; }
+  .df { display:flex; flex-wrap:wrap; gap:8px; padding:12px 20px; border-top:1px solid var(--line); }
+  .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+  .fld { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--mute); }
+  .fld > * { font-size:14px; }
+  .lbls { display:flex; flex-wrap:wrap; gap:6px; }
+  .cm { border-top:1px solid var(--line); padding-top:8px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .cm small { color:var(--mute); }
+  .hint { font-size:12.5px; color:var(--mute); }
+  code { font:12.5px var(--mono); background:var(--bg); padding:1px 5px; border-radius:4px; }
+  .phone-only { display:none; }
+  @media (max-width:1100px) { nav { width:190px; } aside { width:320px; } }
+  @media (max-width:760px) {
+    body { height:100dvh; }
+    input, select, textarea { font-size:16px; }
+    button { min-height:40px; }
+    button.link, button.chip, .f { min-height:0; }
+    .phone-only { display:inline-block; }
+    header { gap:8px; padding:8px 12px; }
+    .tabs { order:2; flex:1 1 100%; } .tabs button { flex:1; padding:5px 4px; }
+    #filter { order:3; flex:1 1 100%; width:auto; }
+    #refresh { display:none; }
+    .wrap { flex-direction:column; }
+    nav { width:auto; border-right:0; border-bottom:1px solid var(--line); }
+    nav input { margin:8px 12px; }
+    #repoList { display:flex; gap:6px; overflow-x:auto; padding:0 12px 8px; }
+    .repo { width:auto; flex:none; border:1px solid var(--line2); border-radius:18px; padding:4px 12px; }
+    .repo small { display:none; }
+    main { padding:12px; }
+    .board { overflow-x:auto; scroll-snap-type:x mandatory; margin:0 -12px; padding:0 12px 8px; }
+    .col { flex:0 0 84vw; min-width:0; scroll-snap-align:center; }
+    .tree .row { flex-wrap:wrap; }
+    .code { flex-direction:column; align-items:stretch; }
+    .files { width:auto; max-height:210px; }
+    .viewer pre { max-height:none; }
+    aside { display:none; width:auto; flex:1; min-height:0; border-left:0; }
+    body.chat aside { display:flex; }
+    body.chat main, body.chat nav, body.chat #filter { display:none; }
+    .grid { grid-template-columns:minmax(0,1fr); }
+    .db { max-height:64dvh; padding:14px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><i></i>gh-board</div>
+  <div class="tabs" id="tabs">
+    <button data-v="board" class="on">Board</button><button data-v="tree">Hierarchy</button><button data-v="code">Code</button><button data-v="chat" class="phone-only">Chat</button>
+  </div>
+  <input id="filter" placeholder="Filter by title, label, @person" aria-label="Filter issues">
+  <button id="newBtn" class="accent">New issue</button>
+  <button id="refresh">Refresh</button>
+  <button id="acct">Connect GitHub</button>
+</header>
+<div class="wrap">
+  <nav aria-label="Repositories">
+    <input id="repoQ" placeholder="Find or type owner/name" aria-label="Find repository">
+    <div id="repoList"></div>
+  </nav>
+  <main><div id="status"></div><div id="view"></div></main>
+  <aside id="chat" aria-label="Claude chat">
+    <div class="ah">Ask Claude <label><input type="checkbox" id="auto"> Auto-approve writes</label></div>
+    <div id="log"></div>
+    <div id="pend"></div>
+    <form id="form">
+      <label class="clip" title="Attach files">Attach<input type="file" id="fileIn" multiple hidden></label>
+      <textarea id="msg" rows="1" placeholder="Triage, create epics from a spec, write a report…" aria-label="Message"></textarea>
+      <button class="primary">Send</button>
+    </form>
+  </aside>
+</div>
+
+<dialog id="issueDlg"><form method="dialog" id="issueForm"></form></dialog>
+<dialog id="authDlg"><div id="authBody"></div></dialog>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const S = { repo: localStorage.repo || '', view: 'board', data: { columns: [], issues: [], prefix: 'status:' }, labels: [], milestones: [], assignees: [], repos: [], session: null, chatId: (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)), files: [], busy: false, tree: {}, file: null, auth: {} };
+
+function status(t, err) { const el = $('#status'); el.textContent = t || ''; el.classList.toggle('err', !!err); }
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const isStatus = (l) => l.toLowerCase().startsWith(S.data.prefix.toLowerCase());
+const hex = (c) => (/^[0-9a-f]{6}$/i.test(c || '') ? c : '888888');
+const chip = (l, extra = '') => `<span class="chip ${extra}" style="background:#${hex(l.color)}2e;border-color:#${hex(l.color)}">${esc(l.name)}</span>`;
+
+/* ------------------------------ GitHub auth ------------------------------ */
+async function refreshAuth(open) {
+  S.auth = await api('/api/auth/status').catch((e) => ({ connected: false, error: e.message }));
+  $('#acct').innerHTML = S.auth.connected ? `<img src="${esc(S.auth.avatar)}" alt="">${esc(S.auth.login)}` : 'Connect GitHub';
+  if (!S.auth.connected && open) openAuth();
+  return S.auth.connected;
+}
+function openAuth(note) {
+  const a = S.auth;
+  $('#authBody').innerHTML = `
+    <div class="dh">GitHub account <button class="link" id="aClose">Close</button></div>
+    <div class="db">
+      ${a.connected ? `<div>Connected as <b>${esc(a.login)}</b> <span class="hint">(${esc(a.source || '')})</span></div>` : '<div>Not connected.</div>'}
+      ${note ? `<div class="hint" style="color:var(--bad)">${esc(note)}</div>` : ''}
+      ${a.deviceFlow ? `<div><button class="primary" id="aDevice">Sign in with GitHub</button><div id="aCode" class="hint" style="margin-top:8px"></div></div>` : ''}
+      <label class="fld">Personal access token
+        <input type="password" id="aTok" placeholder="ghp_…" autocomplete="off"></label>
+      <div class="hint">Use a classic token with <code>repo</code> and <code>read:org</code> so repos you were invited to show up.
+        <a href="https://github.com/settings/tokens/new?scopes=repo,read:org&description=gh-board" target="_blank" rel="noopener">Create one on GitHub</a>.
+        If an org uses SSO, authorize the token for it. The token is saved only on this computer, in <code>.gh-token</code>.</div>
+    </div>
+    <div class="df"><button class="primary" id="aSave">Connect</button>${a.connected ? '<button id="aOut">Disconnect</button>' : ''}</div>`;
+  const dlg = $('#authDlg'); if (!dlg.open) dlg.showModal();
+  $('#aClose').onclick = () => dlg.close();
+  $('#aSave').onclick = async () => {
+    try { await api('/api/auth/token', { token: $('#aTok').value }); dlg.close(); await boot(); }
+    catch (e) { openAuth(e.message); }
+  };
+  if ($('#aOut')) $('#aOut').onclick = async () => { await api('/api/auth/logout', {}); await refreshAuth(); S.repos = []; renderRepos(); openAuth(); };
+  if ($('#aDevice')) $('#aDevice').onclick = async () => {
+    try {
+      const d = await api('/api/auth/device', {});
+      $('#aCode').innerHTML = `Open <a href="${esc(d.verification_uri)}" target="_blank" rel="noopener">${esc(d.verification_uri)}</a> and enter code <code>${esc(d.user_code)}</code>. Waiting…`;
+      const t = setInterval(async () => {
+        const s = await api('/api/auth/status').catch(() => ({}));
+        if (s.connected) { clearInterval(t); dlg.close(); boot(); }
+        else if (s.device?.status === 'error') { clearInterval(t); openAuth(s.device.error); }
+        else if (!dlg.open) clearInterval(t);
+      }, 3000);
+    } catch (e) { openAuth(e.message); }
+  };
+}
+$('#acct').onclick = () => openAuth();
+
+/* --------------------------------- repos --------------------------------- */
+async function loadRepos() {
+  try { S.repos = (await api('/api/repos')).filter((r) => r.issues); } catch (e) { status('Repo list failed: ' + e.message, true); }
+  renderRepos();
+}
+function renderRepos() {
+  const q = $('#repoQ').value.trim().toLowerCase();
+  $('#repoList').innerHTML = S.repos.filter((r) => !q || r.name.toLowerCase().includes(q))
+    .map((r) => `<button class="repo ${r.name === S.repo ? 'on' : ''}" data-r="${esc(r.name)}"><span>${esc(r.name)}</span><small>${esc(r.role)}</small></button>`).join('')
+    || '<div class="hint" style="padding:8px 10px">No match. Press Enter to open what you typed.</div>';
+}
+$('#repoQ').addEventListener('input', renderRepos);
+$('#repoQ').addEventListener('keydown', (e) => { if (e.key === 'Enter' && /^[\w.-]+\/[\w.-]+$/.test(e.target.value.trim())) pickRepo(e.target.value.trim()); });
+$('#repoList').addEventListener('click', (e) => { const b = e.target.closest('.repo'); if (b) pickRepo(b.dataset.r); });
+function pickRepo(r) { S.repo = r; localStorage.repo = r; S.tree = {}; S.file = null; renderRepos(); load(); }
+
+async function load() {
+  if (!S.repo) { status('Pick a repository on the left.'); return; }
+  status('Loading ' + S.repo + '…');
+  const r = encodeURIComponent(S.repo);
+  try {
+    const [data, labels, ms, as] = await Promise.all([
+      api('/api/issues?repo=' + r),
+      api('/api/labels?repo=' + r).catch(() => []), api('/api/milestones?repo=' + r).catch(() => []), api('/api/assignees?repo=' + r).catch(() => []),
+    ]);
+    Object.assign(S, { data, labels, milestones: ms, assignees: as });
+    status(`${S.repo} · ${data.issues.length} issues`);
+  } catch (e) { status(e.message, true); return; }
+  render();
+}
+
+/* --------------------------------- views --------------------------------- */
+function shown() {
+  const f = $('#filter').value.toLowerCase();
+  return S.data.issues.filter((i) => !f || (`${i.title} ${i.labels.join(' ')} ${i.assignees.map((a) => '@' + a).join(' ')} #${i.number} ${i.milestone?.title || ''}`).toLowerCase().includes(f));
+}
+function cardMeta(i) {
+  const labels = (i.labelObjs || []).filter((l) => !isStatus(l.name)).map((l) => chip(l)).join('');
+  const sub = i.sub?.total ? `<span class="chip">${i.sub.completed}/${i.sub.total} sub</span>` : '';
+  const ms = i.milestone ? `<span class="chip">${esc(i.milestone.title)}</span>` : '';
+  const who = i.assignees.length ? `<span class="who">${i.assignees.map((a) => '@' + esc(a)).join(' ')}</span>` : '';
+  return labels + sub + ms + who;
+}
+function render() {
+  document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.view));
+  document.body.classList.toggle('chat', S.view === 'chat');
+  ({ board: renderBoard, tree: renderHier, code: renderCode, chat: renderBoard })[S.view]();
+}
+function renderBoard() {
+  const issues = shown(), v = $('#view');
+  v.innerHTML = '<div class="board"></div>';
+  for (const col of S.data.columns) {
+    const items = issues.filter((i) => i.column === col);
+    const el = document.createElement('section');
+    el.className = 'col';
+    el.innerHTML = `<h2>${esc(col)} <span>${items.length}</span></h2><div class="cards">${items.map((i) => `
+      <div class="card" draggable="true" data-n="${i.number}" tabindex="0">
+        <div class="num">#${i.number}${i.parent ? ` · child of #${i.parent}` : ''}</div>
+        <div class="t">${esc(i.title)}</div><div class="meta">${cardMeta(i)}</div>
+      </div>`).join('')}</div>`;
+    el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('over'); });
+    el.addEventListener('dragleave', () => el.classList.remove('over'));
+    el.addEventListener('drop', async (e) => {
+      e.preventDefault(); el.classList.remove('over');
+      const n = Number(e.dataTransfer.getData('text/plain')), issue = S.data.issues.find((x) => x.number === n);
+      if (!issue || issue.column === col) return;
+      const prev = issue.column; issue.column = col; renderBoard();
+      try { await api('/api/move', { repo: S.repo, number: n, column: col }); }
+      catch (err) { issue.column = prev; renderBoard(); status('Move failed: ' + err.message, true); }
+    });
+    v.firstChild.appendChild(el);
+  }
+}
+function renderHier() {
+  const issues = shown(), have = new Set(issues.map((i) => i.number)), kids = new Map();
+  for (const i of issues) { const p = i.parent && have.has(i.parent) ? i.parent : 0; if (!kids.has(p)) kids.set(p, []); kids.get(p).push(i); }
+  const row = (i, d) => `<div class="row ${i.state}" data-n="${i.number}" style="padding-left:${10 + d * 26}px" tabindex="0">
+      <span class="num">#${i.number}</span><span class="t">${esc(i.title)}</span><span class="meta" style="margin:0">${cardMeta(i)}</span>
+      <span class="chip">${esc(i.column)}</span><button class="link" data-sub="${i.number}">Add sub-issue</button></div>`
+    + (d < 8 ? (kids.get(i.number) || []).map((k) => row(k, d + 1)).join('') : '');
+  $('#view').innerHTML = `<div class="tree" style="border:1px solid var(--line);border-radius:10px;overflow:hidden">${(kids.get(0) || []).map((i) => row(i, 0)).join('') || '<div class="hint" style="padding:14px">No issues.</div>'}</div>
+    <div class="hint" style="margin-top:8px">Hierarchy uses GitHub sub-issues. Open an issue to change its parent.</div>`;
+}
+$('#view').addEventListener('click', (e) => {
+  const sub = e.target.closest('[data-sub]');
+  if (sub) { e.stopPropagation(); return openIssue(null, { parent: Number(sub.dataset.sub) }); }
+  const c = e.target.closest('[data-n]'); if (c) return openIssue(Number(c.dataset.n));
+  const f = e.target.closest('.f'); if (f) return f.dataset.t === 'dir' ? toggleDir(f.dataset.p) : openFile(f.dataset.p);
+  if (e.target.id === 'fIssue') return openIssue(null, { title: `Change in ${S.file.path}`, body: `File: \`${S.file.path}\`\n${S.file.url}\n\n` });
+  if (e.target.id === 'fAsk') { if (matchMedia('(max-width:760px)').matches) { S.view = 'chat'; render(); } $('#msg').value = `Read ${S.file.path} and `; $('#msg').focus(); }
+});
+$('#view').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.dataset?.n) openIssue(Number(e.target.dataset.n)); });
+$('#view').addEventListener('dragstart', (e) => { const c = e.target.closest('.card'); if (c) e.dataTransfer.setData('text/plain', c.dataset.n); });
+
+/* ---------------------------------- code --------------------------------- */
+async function fetchDir(p) { S.tree[p] = { open: true, items: await api(`/api/tree?repo=${encodeURIComponent(S.repo)}&path=${encodeURIComponent(p)}`) }; }
+async function toggleDir(p) {
+  try { if (S.tree[p]) S.tree[p].open = !S.tree[p].open; else await fetchDir(p); } catch (e) { status(e.message, true); }
+  renderCode();
+}
+async function openFile(p) {
+  try { S.file = await api(`/api/file?repo=${encodeURIComponent(S.repo)}&path=${encodeURIComponent(p)}`); } catch (e) { S.file = { path: p, content: e.message, url: '' }; }
+  renderCode();
+}
+function dirHtml(p, d) {
+  return (S.tree[p]?.items || []).map((e) => `<button class="f ${S.file?.path === e.path ? 'on' : ''}" data-t="${e.type}" data-p="${esc(e.path)}" style="padding-left:${6 + d * 14}px">${e.type === 'dir' ? (S.tree[e.path]?.open ? '▾ ' : '▸ ') : '  '}${esc(e.name)}</button>`
+    + (e.type === 'dir' && S.tree[e.path]?.open ? dirHtml(e.path, d + 1) : '')).join('');
+}
+async function renderCode() {
+  if (!S.repo) return;
+  if (!S.tree['']) { try { await fetchDir(''); } catch (e) { $('#view').innerHTML = `<div class="hint">${esc(e.message)}</div>`; return; } }
+  const f = S.file;
+  $('#view').innerHTML = `<div class="code"><div class="files">${dirHtml('', 0)}</div><div class="viewer">${f
+    ? `<div class="bar"><span style="flex:1">${esc(f.path)}</span><button id="fIssue">New issue from file</button><button id="fAsk">Ask Claude</button>${f.url ? `<a href="${esc(f.url)}" target="_blank" rel="noopener">GitHub</a>` : ''}</div><pre>${esc(f.content)}${f.truncated ? '\n… truncated' : ''}</pre>`
+    : '<div class="hint" style="padding:14px">Pick a file to read it. Claude can read the same files when you ask in chat.</div>'}</div></div>`;
+}
+
+/* ------------------------------ issue dialog ------------------------------ */
+async function openIssue(number, preset = {}) {
+  let it = { title: preset.title || '', body: preset.body || '', labels: [], assignees: [], column: S.data.columns[0], milestone: null, parent: preset.parent || null, state: 'open', sub_issues: [], comment_list: [] };
+  if (number) { try { it = await api(`/api/issue?repo=${encodeURIComponent(S.repo)}&number=${number}`); } catch (e) { return status(e.message, true); } }
+  const sel = new Set(it.labels.filter((l) => !isStatus(l)));
+  const f = $('#issueForm');
+  const lbls = () => S.labels.filter((l) => !isStatus(l.name)).map((l) => `<button type="button" class="chip ${sel.has(l.name) ? '' : 'off'}" data-l="${esc(l.name)}" style="background:#${hex(l.color)}2e;border-color:#${hex(l.color)}" aria-pressed="${sel.has(l.name)}">${esc(l.name)}</button>`).join('');
+  f.innerHTML = `
+    <div class="dh">${number ? `Issue #${number}` : 'New issue'} <button type="button" class="link" id="iX">Close</button></div>
+    <div class="db">
+      <label class="fld">Title<input id="iTitle" value="${esc(it.title)}" required></label>
+      <label class="fld">Description<textarea id="iBody" rows="7">${esc(it.body)}</textarea></label>
+      <div class="grid">
+        <label class="fld">Column<select id="iCol">${S.data.columns.map((c) => `<option ${c === it.column ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+        <label class="fld">Milestone<select id="iMs"><option value="">None</option>${S.milestones.filter((m) => m.state === 'open' || m.number === it.milestone?.number).map((m) => `<option value="${m.number}" ${m.number === it.milestone?.number ? 'selected' : ''}>${esc(m.title)}</option>`).join('')}</select></label>
+        <label class="fld">Assignees (comma-separated)<input id="iWho" value="${esc(it.assignees.join(', '))}" list="whoList"><datalist id="whoList">${S.assignees.map((a) => `<option value="${esc(a)}">`).join('')}</datalist></label>
+        <label class="fld">Parent issue number<input id="iParent" type="number" min="1" value="${it.parent || ''}" placeholder="None"></label>
+      </div>
+      <div class="fld">Labels<div class="lbls" id="iLbls">${lbls()}</div>
+        <div style="display:flex;gap:6px;margin-top:4px"><input id="nlName" placeholder="New label" style="flex:1" aria-label="New label name"><input id="nlColor" type="color" value="#c4552d" aria-label="Label color" style="padding:2px;width:44px"><button type="button" id="nlAdd">Add label</button></div></div>
+      ${number ? `
+        <div class="fld">Sub-issues<div>${it.sub_issues.map((s) => `<div><button type="button" class="link" data-open="${s.number}">#${s.number}</button> ${esc(s.title)} <span class="chip">${esc(s.column)}</span></div>`).join('') || '<span class="hint">None</span>'}</div>
+          <div><button type="button" id="iSub">Add sub-issue</button></div></div>
+        <div class="fld">Comments<div>${it.comment_list.map((c) => `<div class="cm"><small>${esc(c.by)} · ${esc(c.at.slice(0, 10))}</small>\n${esc(c.body)}</div>`).join('') || '<span class="hint">None</span>'}</div>
+          <textarea id="iCm" rows="2" placeholder="Write a comment"></textarea><div><button type="button" id="iCmBtn">Comment</button></div></div>` : ''}
+      <div class="hint" id="iErr" style="color:var(--bad)"></div>
+    </div>
+    <div class="df">
+      <button type="button" class="primary" id="iSave">${number ? 'Save changes' : 'Create issue'}</button>
+      ${number ? `<button type="button" id="iState">${it.state === 'open' ? 'Close issue' : 'Reopen issue'}</button><button type="button" id="iAttach">Attach file</button><a href="${esc(it.url)}" target="_blank" rel="noopener" style="align-self:center">Open on GitHub</a>` : ''}
+    </div>`;
+  const dlg = $('#issueDlg'); if (!dlg.open) dlg.showModal();
+  const fail = (e) => ($('#iErr').textContent = e.message);
+  const done = () => { dlg.close(); load(); };
+  f.onsubmit = (e) => { e.preventDefault(); $('#iSave').click(); };
+  $('#iX').onclick = () => dlg.close();
+  $('#iLbls').onclick = (e) => { const b = e.target.closest('[data-l]'); if (!b) return; sel.has(b.dataset.l) ? sel.delete(b.dataset.l) : sel.add(b.dataset.l); $('#iLbls').innerHTML = lbls(); };
+  $('#nlAdd').onclick = async () => {
+    const name = $('#nlName').value.trim(); if (!name) return;
+    try { const l = await api('/api/label/create', { repo: S.repo, name, color: $('#nlColor').value }); S.labels.push(l); sel.add(l.name); $('#nlName').value = ''; $('#iLbls').innerHTML = lbls(); } catch (e) { fail(e); }
+  };
+  f.querySelectorAll('[data-open]').forEach((b) => (b.onclick = () => openIssue(Number(b.dataset.open))));
+  if (number) {
+    $('#iSub').onclick = () => openIssue(null, { parent: number });
+    $('#iCmBtn').onclick = async () => { const body = $('#iCm').value.trim(); if (!body) return; try { await api('/api/issue/comment', { repo: S.repo, number, body }); openIssue(number); } catch (e) { fail(e); } };
+    $('#iState').onclick = async () => { try { await api('/api/issue/update', { repo: S.repo, number, state: it.state === 'open' ? 'closed' : 'open' }); done(); } catch (e) { fail(e); } };
+    $('#iAttach').onclick = () => { dlg.close(); if (matchMedia('(max-width:760px)').matches) { S.view = 'chat'; render(); } $('#msg').value = `Attach the file(s) to #${number}`; $('#fileIn').click(); };
+  }
+  $('#iSave').onclick = async () => {
+    const title = $('#iTitle').value.trim(); if (!title) return fail(new Error('Title is required.'));
+    const who = $('#iWho').value.split(',').map((s) => s.trim().replace(/^@/, '')).filter(Boolean);
+    const ms = $('#iMs').value ? Number($('#iMs').value) : null, col = $('#iCol').value, parent = $('#iParent').value ? Number($('#iParent').value) : null;
+    $('#iSave').disabled = true;
+    try {
+      if (!number) {
+        await api('/api/issue/create', { repo: S.repo, title, body: $('#iBody').value, labels: [...sel], assignees: who, column: col, ...(ms && { milestone: ms }), ...(parent && { parent_number: parent }) });
+      } else {
+        const before = it.labels.filter((l) => !isStatus(l));
+        await api('/api/issue/update', { repo: S.repo, number, title, body: $('#iBody').value, assignees: who, milestone: ms,
+          add_labels: [...sel].filter((l) => !before.includes(l)), remove_labels: before.filter((l) => !sel.has(l)) });
+        if (col !== it.column) await api('/api/move', { repo: S.repo, number, column: col });
+        if (parent !== (it.parent || null)) await api('/api/issue/parent', { repo: S.repo, number, parent });
+      }
+      done();
+    } catch (e) { fail(e); $('#iSave').disabled = false; }
+  };
+}
+
+/* ---------------------------------- chat --------------------------------- */
+const log = $('#log');
+function add(cls, text) { const d = document.createElement('div'); d.className = 'msg ' + cls; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; return d; }
+function box(html) { const d = document.createElement('div'); d.className = 'box'; d.innerHTML = html; log.appendChild(d); log.scrollTop = log.scrollHeight; return d; }
+function approval(ev) {
+  const d = box(`<b>Approval needed</b><div>${esc(ev.tool)}</div><pre>${esc(JSON.stringify(ev.input, null, 2))}</pre><button class="accent">Approve</button> <button>Reject</button>`);
+  const [yes, no] = d.querySelectorAll('button');
+  const answer = (ok) => { yes.disabled = no.disabled = true; d.querySelector('b').textContent = ok ? 'Approved' : 'Rejected'; api('/api/approve', { id: ev.id, ok }).catch(() => {}); };
+  yes.onclick = () => answer(true); no.onclick = () => answer(false);
+}
+const b64 = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = rej; r.readAsDataURL(file); });
+function addFiles(list) {
+  for (const f of list) S.files.push(f);
+  if (S.files.reduce((n, f) => n + f.size, 0) > 20e6) { S.files = []; status('Attachments are limited to 20 MB per message.', true); }
+  renderPend();
+}
+function renderPend() {
+  $('#pend').innerHTML = S.files.map((f, i) => `<span class="chip">${esc(f.name)} <button type="button" class="link" data-rm="${i}" aria-label="Remove ${esc(f.name)}">×</button></span>`).join('');
+}
+$('#pend').onclick = (e) => { const b = e.target.closest('[data-rm]'); if (b) { S.files.splice(Number(b.dataset.rm), 1); renderPend(); } };
+$('#fileIn').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; $('#msg').focus(); };
+const chatEl = $('#chat');
+chatEl.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); chatEl.classList.add('drop'); } });
+chatEl.addEventListener('dragleave', () => chatEl.classList.remove('drop'));
+chatEl.addEventListener('drop', (e) => { if (!e.dataTransfer.files.length) return; e.preventDefault(); chatEl.classList.remove('drop'); addFiles(e.dataTransfer.files); });
+
+async function send() {
+  const message = $('#msg').value.trim();
+  if ((!message && !S.files.length) || S.busy) return;
+  const sending = S.files; S.files = []; renderPend();
+  $('#msg').value = ''; S.busy = true;
+  add('me', message + (sending.length ? `\n[${sending.map((f) => f.name).join(', ')}]` : ''));
+  try {
+    const files = await Promise.all(sending.map(async (f) => ({ name: f.name, type: f.type, b64: await b64(f) })));
+    const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, repo: S.repo, sessionId: S.session, autoApprove: $('#auto').checked, files, chatId: S.chatId }) });
+    if (!r.ok || !r.body) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const line = buf.slice(0, i).replace(/^data: /, ''); buf = buf.slice(i + 2);
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'session') S.session = ev.sessionId;
+        else if (ev.type === 'text') add('', ev.text);
+        else if (ev.type === 'tool') add('tool', ev.name + ' ' + JSON.stringify(ev.input));
+        else if (ev.type === 'approval') approval(ev);
+        else if (ev.type === 'file') box(`<b>File ready</b><div><a href="/api/download?id=${encodeURIComponent(ev.id)}" download="${esc(ev.name)}">${esc(ev.name)}</a> <span class="hint">${Math.max(1, Math.round(ev.size / 1024))} KB</span></div>`);
+        else if (ev.type === 'error' || (ev.type === 'done' && ev.error)) add('err', ev.error);
+      }
+    }
+  } catch (err) { add('err', err.message); }
+  S.busy = false;
+  if (S.repo) load();
+}
+$('#form').addEventListener('submit', (e) => { e.preventDefault(); send(); });
+$('#msg').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+/* ---------------------------------- wiring -------------------------------- */
+$('#tabs').onclick = (e) => { const v = e.target.dataset.v; if (v) { S.view = v; render(); } };
+$('#filter').addEventListener('input', () => S.view !== 'code' && render());
+matchMedia('(max-width:760px)').addEventListener('change', (e) => { if (!e.matches && S.view === 'chat') { S.view = 'board'; render(); } });
+$('#refresh').onclick = load;
+$('#newBtn').onclick = () => (S.repo ? openIssue(null) : status('Pick a repository first.', true));
+async function boot() {
+  if (!(await refreshAuth(true))) { status('Connect your GitHub account to start.'); return; }
+  await loadRepos();
+  load();
+}
+boot();
+</script>
+</body>
+</html>

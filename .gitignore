@@ -1,0 +1,5 @@
+.env
+.gh-token
+node_modules
+web/dist
+server.log
