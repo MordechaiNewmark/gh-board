@@ -33,7 +33,7 @@ const splitList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(
  */
 export function permissions({ kind = 'tick', autonomy = 'supervised', conf = {}, extra = [] } = {}) {
   const bash = (c) => `Bash(${c})`;
-  const cmds = ['git *', 'gh *', 'jq *', 'test *', 'ls *', 'ls'];
+  const cmds = ['git *', 'gh *', 'jq *', 'test *', 'ls *', 'ls', 'echo *', 'pwd'];
   for (const s of PLUGIN_SCRIPTS[kind] || PLUGIN_SCRIPTS.tick) cmds.push(`bash *scripts/${s}`, `bash *scripts/${s} *`, `bash *scripts/${s}" *`, `bash *scripts/${s}"`);
   for (const c of [conf.GATE_CMD, conf.WORKTREE_SETUP_CMD]) { const v = String(c || '').trim(); if (v) cmds.push(v, `${v} *`); }
   const allow = ['Skill', 'Task', 'Agent', 'TodoWrite', 'Read', 'Glob', 'Grep', 'Edit', 'Write', ...new Set(cmds.map(bash)), ...extra];

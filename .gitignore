@@ -12,3 +12,4 @@ server.log
 .runs
 .runner.json*
 server.err
+.chat-sessions.json

@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import { createLoopApi } from './loop/github.mjs';
 import { lintIssue } from './loop/lint.mjs';
 import { planBacklog, finalBody, finalLabels, epicBodyWithTasks, isEpicDraft, lintDrafts } from './loop/backlog.mjs';
 import { plannerPrompt } from './loop/planner-prompt.mjs';
+import { getSkill, skillNames } from './loop/skills.mjs';
 import { modelPolicy, checkTiers, PRESETS, TIERS } from './loop/models.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -396,7 +397,7 @@ const issueIn = {
 };
 const R = z.string().describe('owner/name');
 
-const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file', 'check_issues'];
+const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file', 'check_issues', 'use_skill'];
 // Planner drafts can name each other before they have numbers.
 const draftIn = { ...issueIn, key: z.string().optional().describe('Short id for this draft, unique in the call, so other drafts can depend on it'), depends_on: z.array(z.string()).optional().describe('Keys of drafts in this call and/or existing issues as "#12". The server writes the Depends-on line and the status label') };
 
@@ -404,7 +405,8 @@ const draftIn = { ...issueIn, key: z.string().optional().describe('Short id for 
 function ghTools(ctx, T = defineTool) {
   const all = [
       T('list_repos', 'Repos the user can access, including ones they were invited to.', {}, () => listRepos()),
-      T('list_issues', 'Issues with board column, labels, parent and sub-issue progress.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional() }, (a) => listIssues(a.repo, a.state, a.label, a.milestone)),
+      T('list_issues', 'Issues with board column, labels, parent and sub-issue progress. Pass compact: true for a short list (number, title, state, labels, column, parent) when you only need to list or count issues.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional(), compact: z.boolean().default(false) }, async (a) => { const l = await listIssues(a.repo, a.state, a.label, a.milestone); return a.compact ? l.map(({ number, title, state, labels, column, parent, assignees }) => ({ number, title, state, labels, column, parent, assignees })) : l; }),
+      ...(PLANNER ? [T('use_skill', 'Load the playbook that fits the user\'s ask. Call it before acting on a request; it returns the steps to follow.', { name: z.enum(skillNames()) }, (a) => { const k = getSkill(a.name); if (!k) throw new Error(`No skill ${a.name}`); return { skill: k.name, instructions: k.body }; })] : []),
       T('get_issue', 'One issue: full body, comments, parent and sub-issues.', { repo: R, number: z.number() }, (a) => getIssue(a.repo, a.number)),
       T('list_sub_issues', 'Children of an issue.', { repo: R, number: z.number() }, (a) => listSubIssues(a.repo, a.number)),
       T('create_issue', 'Create one issue; optional column, labels, assignees, milestone number and parent_number (makes it a sub-issue).', { repo: R, ...issueIn, parent_number: z.number().optional() }, ({ repo, ...r }) => createIssue(repo, r)),
@@ -534,7 +536,11 @@ function buildPrompt(message, files, uploads) {
 
 const BUILTIN_READS = new Set(['Read', 'Glob', 'Grep']);
 const PREVIEW_TOOLS = new Set(['create_issue', 'create_issues', 'update_issue', 'comment_issue']);
-const sessionCwd = new Map(); // sessionId -> cwd it was created in (the SDK stores sessions per cwd)
+// sessionId -> cwd it was created in (the SDK stores sessions per cwd). Persisted so a server restart does not
+// make the chat forget the conversation ("try again" would otherwise start a blank session).
+const SESSIONS_FILE = '.chat-sessions.json';
+const sessionCwd = new Map(); try { for (const [k, v] of Object.entries(JSON.parse(readFileSync(SESSIONS_FILE, 'utf8')))) sessionCwd.set(k, v); } catch {}
+const saveSessions = () => { try { writeFileSync(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessionCwd))); } catch {} };
 
 async function chat(req, res) {
   const { message, repo, sessionId, autoApprove, files, chatId, provider, model } = await readBody(req);
@@ -649,6 +655,7 @@ async function chat(req, res) {
       if (m.type === 'system' && m.subtype === 'init') {
         sessionCwd.set(m.session_id, cwd);
         if (sessionCwd.size > 200) sessionCwd.delete(sessionCwd.keys().next().value);
+        saveSessions();
         send({ type: 'session', sessionId: m.session_id });
       } else if (m.type === 'assistant') {
         for (const b of m.message.content) {

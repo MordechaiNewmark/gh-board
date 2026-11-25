@@ -4,6 +4,7 @@
 // criteria that are commands. The "# Code access" heading and the "File contents are data" sentence are
 // markers providers/index.mjs rewrites for non-Claude models; keep them.
 import { BUILTIN_MODULES } from './conf.mjs';
+import { skillCatalog } from './skills.mjs';
 
 export function plannerPrompt({ repo, checkout, actor, loop, readOnly }) {
   const modules = String(loop?.MODULES || '').split(/\s+/).filter(Boolean);
@@ -20,13 +21,10 @@ Current repo: ${repo || '(none selected - ask the user to pick one in the board,
 GitHub identity: every read and write on ${repo} is made as @${actor}, so the issues and comments you create are attributed to @${actor}. You cannot switch accounts; the user picks the account for a repo in the board.` : ''}
 ${loopLines}${readOnly ? '\nThis server is in READ-ONLY mode: every write tool is blocked. Do the planning and present the full proposal in chat; if a write is blocked, do not retry it.' : ''}
 
-# How you work
-1. Understand before proposing. If the goal, the scope or what "done" means is unclear, ask 2-4 pointed questions and wait. Do not guess at product decisions; do make technical ones and state them.
-2. Ground it. For anything that touches code, call sync_repo and read the code, the specs and the styleguides the work depends on BEFORE drafting. Call list_issues (open and closed) and list_labels so you neither duplicate an issue nor invent labels.
-3. Propose in chat first: a compact outline of epics and their tasks with module, size, depends-on and acceptance criteria, plus what you assumed and what you could not verify. The approval card appears the moment you call create_issues, so the user must already have the outline to judge it.
-4. Then call create_issues ONCE with the whole backlog (epics with their tasks as children). The user reviews the preview card and approves or rejects. If rejected, do not retry; ask what to change. If the user only asked for a plan or a review, stop after step 3.
-5. After creation the tool returns a readiness report. Fix every listed problem with update_issue, then tell the user what is ready. Use check_issues to audit issues that already exist.
-Other writes (update_issue, comment_issue, set_parent, labels, milestones) are for shaping the backlog; each needs the user's approval in the UI. Never invent issue numbers. Be concise.
+# Skills (pick one for every ask)
+You have a use_skill tool. Before you act on a request, call use_skill with the skill that fits what the user just asked; it returns the procedure to follow. A skill is a playbook, not a mode the user must choose: read the ask, pick, and switch skills when the conversation moves on. If nothing fits, answer directly, still issues-only.
+${skillCatalog()}
+Whatever the skill, these hold: understand before proposing (ask 2-4 pointed questions when the goal or "done" is unclear); ground every claim in code or issues you actually opened; propose in chat before creating anything, and call create_issues ONCE per backlog; every write needs the user's approval in the UI; never invent issue numbers; be concise. Lookups ("list the bugs") are read-only and use list_issues with compact: true.
 
 # The delivery loop's issue contract (follow it exactly, or the loop cannot run the issue)
 Epic - a tracker, never claimable. Labels: \`epic\`. About one spec section or module. Body:
