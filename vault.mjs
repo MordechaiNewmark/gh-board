@@ -40,7 +40,7 @@ export function createVault(secret, env = process.env) {
   const needDb = () => { if (!configured) throw new Error('No database is connected, so this cannot be saved. In the Vercel project open Storage, add an Upstash Redis database, then redeploy.'); };
 
   return {
-    configured, seal, open, needDb,
+    configured, seal, open, needDb, command,
     /** The stored entry as sealed text, or ''. */
     read: async () => (configured ? String((await command(['GET', ENTRY])) || '') : ''),
     write: async (sealed) => { needDb(); await command(['SET', ENTRY, sealed]); },

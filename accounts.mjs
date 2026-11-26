@@ -3,6 +3,7 @@
 // token to a caller outside the server: the public shapes carry login, avatar, source and status only.
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
+import { assertApiPath, assertRepo } from './security.mjs';
 
 const SOURCE_LABEL = { token: 'token saved in this app', device: 'GitHub sign-in', env: 'GITHUB_TOKEN in .env', cli: 'GitHub CLI' };
 const RANK = { admin: 3, write: 2, read: 1 };
@@ -104,6 +105,7 @@ export function createAccounts({ dir, apiBase = 'https://api.github.com', envTok
   /** One GitHub request as a given account. 401 flags that account only; the others keep working. */
   async function ghAs(acct, path, { method = 'GET', body } = {}) {
     if (readOnly && method !== 'GET') throw new Error('Read-only mode (READ_ONLY=1): writes to GitHub are disabled.');
+    assertApiPath(path);
     let res;
     try { res = await raw(acct.token, path, { method, body }); } catch (e) { throw new Error(`Could not reach GitHub as @${acct.login}: ${scrub(e.message || e)}`); }
     if (res.status === 401) {
@@ -332,6 +334,7 @@ export function createAccounts({ dir, apiBase = 'https://api.github.com', envTok
   }
   /** The account whose token serves this repo: explicit override, else highest permission (ties: default account). */
   async function accountFor(repo) {
+    assertRepo(repo);
     await init();
     const list = all();
     if (!list.length) throw new Error(NOT_CONNECTED);

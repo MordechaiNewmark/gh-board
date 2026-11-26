@@ -87,11 +87,11 @@ export function useLoop(repo: string, enabled: boolean) {
   const [loading, setLoading] = useState(false);
   const live = useRef({ repo: "", ticket: 0 });
 
-  const loadData = useCallback(async (fresh = false) => {
+  const loadData = useCallback(async (fresh = false, background = false) => {
     if (!repo) return;
     const ticket = ++live.current.ticket;
     try {
-      const d = await api<LoopData>(`/api/loop?repo=${q(repo)}${fresh ? "&fresh=1" : ""}`);
+      const d = await api<LoopData>(`/api/loop?repo=${q(repo)}${fresh ? "&fresh=1" : ""}`, undefined, { background });
       if (ticket === live.current.ticket && live.current.repo === repo) { setData(d); setError(""); }
     } catch (e) { if (ticket === live.current.ticket) setError(errMsg(e)); }
   }, [repo]);
@@ -113,9 +113,9 @@ export function useLoop(repo: string, enabled: boolean) {
     if (!repo || !enabled) return;
     const status = window.setInterval(() => {
       if (document.hidden) return;
-      api<RunStatus>(`/api/runner/status?repo=${q(repo)}`).then((s) => { if (live.current.repo === repo) setRun(s); }).catch(() => {});
+      api<RunStatus>(`/api/runner/status?repo=${q(repo)}`, undefined, { background: true }).then((s) => { if (live.current.repo === repo) setRun(s); }).catch(() => {});
     }, active ? 1500 : 15000);
-    const board = window.setInterval(() => { if (!document.hidden) void loadData(); }, active ? 6000 : 90000);
+    const board = window.setInterval(() => { if (!document.hidden) void loadData(false, true); }, active ? 6000 : 90000);
     return () => { window.clearInterval(status); window.clearInterval(board); };
   }, [repo, enabled, active, loadData]);
 

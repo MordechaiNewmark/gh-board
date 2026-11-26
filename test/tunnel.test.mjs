@@ -65,12 +65,16 @@ test('on: remote needs the key, cannot change the setting, and cannot pose as lo
   const remote = { host: HOST, ...proxied };
   assert.equal((await send('/api/tunnel', { headers: remote })).status, 401);
   assert.equal((await send('/api/tunnel', { headers: proxied })).status, 401, 'Host: localhost through the proxy');
-  assert.equal((await send('/api/tunnel', { headers: { ...remote, cookie: 'ghb=wrong' } })).status, 401);
+  assert.equal((await send('/api/tunnel', { headers: { ...remote, cookie: 'ghbs=wrong-token-000000000000000' } })).status, 401);
 
   const login = await send(`/?key=${key}`, { headers: remote });
   assert.equal(login.status, 303);
   assert.match(login.headers['set-cookie'][0], /HttpOnly; SameSite=Strict; .*Secure/);
-  const authed = { ...remote, cookie: `ghb=${key}`, origin: `https://${HOST}` };
+  const cookie = login.headers['set-cookie'][0].split(';')[0];
+  assert.match(cookie, /^ghbs=/);
+  assert.ok(!cookie.includes(key), 'the cookie holds a session token, not the key');
+  assert.equal((await send('/api/tunnel', { headers: { ...remote, cookie: `ghbs=${key}` } })).status, 401);
+  const authed = { ...remote, cookie, origin: `https://${HOST}` };
   const seen = await send('/api/tunnel', { headers: authed });
   assert.deepEqual(seen.json, { enabled: true, url: `https://${HOST}`, local: false });
   assert.ok(!seen.text.includes(key));

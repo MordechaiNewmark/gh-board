@@ -446,10 +446,30 @@ spend your Claude usage. The computer must stay on and awake.
 `vercel.json` sends every path to `api/index.mjs`, which runs the same request handler (`hosted.mjs` holds the
 differences). Set in the Vercel project: `ACCESS_KEY` (12+ characters; until then every request gets 503),
 optionally `GITHUB_TOKEN` and `AI_GATEWAY_API_KEY` (otherwise the deployment's OIDC token is offered to AI Gateway).
-`NODEJS_HELPERS=0` keeps request bodies unread for the handler. Open the site once with `?key=<ACCESS_KEY>`.
+`NODEJS_HELPERS=0` keeps request bodies unread for the handler. Sign in on the page with the access key.
 
 Available: boards, issue view/create/update/close/comment, loop status and review pages, and a chat that reads the repo
 through the GitHub API. Not available: the runner, local code search, the Claude sign-in settings. GitHub tokens and provider keys
 added in the UI are saved, encrypted with a key derived from `ACCESS_KEY` (`vault.mjs`), in an Upstash Redis database
 connected under the project's Storage tab (`KV_REST_API_URL`, `KV_REST_API_TOKEN`). Changing `ACCESS_KEY` discards them. Chat history and
 pending approvals live in one server instance's memory, so a conversation can reset, and an approval can fail to arrive.
+
+## Sign-in sessions
+
+Wherever a key is required (hosted, `ACCESS_KEY` set, or a remote tunnel request), the key is exchanged for a random
+session token in an HttpOnly cookie (`session.mjs`). Only its hash is stored: in the database when hosted (sign-in
+needs one), in `.sessions.json` locally. A session ends after 12 hours without use (automatic refreshes do not count),
+7 days after sign-in, on Sign out or Sign out everywhere (Settings), or when its key changes. Ten sign-in attempts from
+one address lock it out for 15 minutes. `?key=` links work only on the local board, for the tunnel.
+
+## Security notes
+
+`security.mjs` sets the response headers (CSP limiting scripts to the board and images to the board and GitHub), refuses
+cross-site requests, and validates repo names, issue numbers and GitHub API paths. A saved provider key is forgotten when
+its address changes; the hosted board also refuses chosen environment variable names and non-public provider addresses.
+
+**Not a security boundary: the runner.** Loop sessions may run `node`, `python`, `git`, package managers and the
+repo's own scripts as your user, with your GitHub token in their environment. A hostile issue, dependency or repository
+that steers them can read your files, call this server on localhost, or push and merge through the API, whatever the
+denied-command list says. Run the loop only on repositories you trust, protect the base branch on GitHub (require a
+human review), and give the runner a fine-grained token limited to that repository, or run it in a container or VM.

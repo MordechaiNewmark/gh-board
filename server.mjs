@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename, normalize, extname, sep } from 'node:path';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
@@ -13,8 +13,10 @@ import { createClaudeAuth } from './claude-auth.mjs';
 import { createTunnel, isRemote } from './tunnel.mjs';
 import { locked, readForm } from './signin.mjs';
 import { createVault } from './vault.mjs';
+import { securityHeaders, allowInlineScripts, issueNumber } from './security.mjs';
+import { createSessions, fileStore, redisStore, sessionCookie, readSessionCookie, clientAddress, IDLE_S, MAX_S } from './session.mjs';
 import { initProviders, providerRoutes, isClaude, runProviderChat, defineTool, offerKey, snapshotProviders, restoreProviders } from './providers/index.mjs';
-import { isHosted, prepareHosted, localOnlyRoute, savesState, hostedNote, HOSTED_TOOLS_OFF, GATEWAY_ID, GATEWAY_KEY_ENV } from './hosted.mjs';
+import { isHosted, prepareHosted, localOnlyRoute, savesState, checkHostedProvider, hostedNote, HOSTED_TOOLS_OFF, GATEWAY_ID, GATEWAY_KEY_ENV } from './hosted.mjs';
 import { createRunner } from './runner/index.mjs';
 import { RUNNABLE_SKILLS } from './runner/command.mjs';
 import { createLoopApi } from './loop/github.mjs';
@@ -156,6 +158,7 @@ async function listSubIssues(repo, number) {
 }
 
 async function getIssue(repo, number) {
+  number = issueNumber(number);
   const { gh } = await forRepo(repo);
   const [i, comments, subs] = await Promise.all([
     gh(`/repos/${repo}/issues/${number}`),
@@ -170,6 +173,7 @@ async function getIssue(repo, number) {
 }
 
 async function moveIssue(repo, number, columnName) {
+  number = issueNumber(number);
   const { gh } = await forRepo(repo);
   const column = colFromName(columnName);
   if (!column) throw new Error(`Unknown column "${columnName}". Columns: ${COLUMNS.join(', ')}`);
@@ -184,6 +188,8 @@ async function moveIssue(repo, number, columnName) {
 }
 
 async function setParent(repo, number, parent) {
+  number = issueNumber(number);
+  if (parent != null) parent = issueNumber(parent);
   const { gh } = await forRepo(repo);
   const child = await gh(`/repos/${repo}/issues/${number}`);
   if (parent == null) {
@@ -263,6 +269,7 @@ async function checkIssues(repo, numbers) {
 }
 
 async function updateIssue(repo, number, { title, body, assignees, add_labels, remove_labels, state, milestone }) {
+  number = issueNumber(number);
   const { gh } = await forRepo(repo);
   const patch = {};
   if (title !== undefined) patch.title = title;
@@ -277,6 +284,7 @@ async function updateIssue(repo, number, { title, body, assignees, add_labels, r
 }
 
 async function commentIssue(repo, number, body) {
+  number = issueNumber(number);
   const { gh } = await forRepo(repo);
   return { url: (await gh(`/repos/${repo}/issues/${number}/comments`, { method: 'POST', body: { body } })).html_url };
 }
@@ -756,6 +764,9 @@ const routes = {
   'POST /api/tunnel/enable': (url, body, req) => { localOnly(req); if (body?.confirm !== true) throw new Error('Confirmation required: turning on remote access.'); return tunnel.enable(); },
   'POST /api/tunnel/disable': (url, body, req) => { localOnly(req); return tunnel.disable(); },
   'POST /api/tunnel/rotate': (url, body, req) => { localOnly(req); return tunnel.rotate(); },
+  'GET /api/session': (url, body, req) => ({ signedIn: !!req.session, idleHours: IDLE_S / 3600, maxDays: MAX_S / 86400 }),
+  'POST /api/session/logout': async (url, body, req) => { await sessions.signOut(req.session); req.endSession = true; return { ok: true }; },
+  'POST /api/session/logout-all': async (url, body, req) => { await sessions.signOutAll(); req.endSession = true; return { ok: true }; },
   'GET /api/auth/status': () => authStatus(),
   // ?check=1 re-validates every token, so a revoked one shows as "needs attention".
   'GET /api/auth/accounts': async (u) => ({ ...(q(u, 'check') ? await accounts.check() : await accounts.list()), deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY }),
@@ -835,9 +846,6 @@ async function serveBuilt(pathname, res) {
 const HOST = process.env.HOST || '127.0.0.1';
 const KEY = (process.env.ACCESS_KEY || '').trim(); // a pasted value often carries a trailing space or newline
 const LOCAL = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, ...(process.env.ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean)]);
-const sha = (v) => createHash('sha256').update(String(v)).digest();
-// ACCESS_KEY (.env) guards every request. The tunnel key (Settings > Remote access) guards remote ones.
-const keyOk = (v) => !!v && [KEY, tunnel.key()].some((k) => !!k && timingSafeEqual(sha(v), sha(k)));
 if (!HOSTED && !['127.0.0.1', 'localhost', '::1'].includes(HOST) && KEY.length < 12) {
   console.error('HOST is not loopback: set ACCESS_KEY (12+ characters) in .env so only you can open the board.');
   process.exit(1);
@@ -847,6 +855,12 @@ if (!HOSTED && !['127.0.0.1', 'localhost', '::1'].includes(HOST) && KEY.length <
 const vault = HOSTED ? createVault(KEY) : null;
 const BASE_PROVIDERS = HOSTED ? snapshotProviders() : null;
 let applied = ''; // the stored entry this instance currently holds
+// ACCESS_KEY guards every request, and the tunnel key (Settings > Remote access) the remote ones. Either one is
+// exchanged for an expiring session (session.mjs); hosted sessions live in the database.
+const sessions = createSessions({
+  store: vault ? redisStore(async (args) => { vault.needDb(); return vault.command(args); }) : fileStore(join(DATA_DIR, '.sessions.json')),
+  keys: () => [KEY, tunnel.key()],
+});
 async function useStored() {
   const sealed = await vault.read();
   if (sealed === applied) return;
@@ -857,24 +871,37 @@ async function useStored() {
 }
 
 export async function handler(req, res) {
-  const url = new URL(req.url, 'http://x');
+  let url;
+  // A malformed address must not throw: before sign-in, that would let anyone who can connect stop the server.
+  try { url = new URL(req.url, 'http://x'); } catch { return json(res, 400, { error: 'Bad request.' }); }
   const key = `${req.method} ${url.pathname}`;
   const origin = req.headers.origin;
+  const isApi = url.pathname.startsWith('/api/');
+  securityHeaders(res, { https: !!HOSTED || req.headers['x-forwarded-proto'] === 'https', api: isApi });
+  if (req.headers['sec-fetch-site'] === 'cross-site' && (isApi || req.method !== 'GET')) return json(res, 403, { error: 'Requests from other sites are refused.' });
   // Hosted, the platform only routes this deployment's own domains here, so the page must just match the host.
   const allowed = (h) => (HOSTED ? !!h && h === req.headers.host : LOCAL.has(h) || (!!h && h === tunnel.host()));
   if (HOSTED && KEY.length < 12) return json(res, 503, { error: 'Not set up yet: add an ACCESS_KEY environment variable (12+ characters) to this Vercel project, then redeploy.' });
   if (!allowed(req.headers.host) || (origin && !allowed(origin.replace(/^https?:\/\//, '')))) return json(res, 403, { error: 'Requests are only accepted from this app on localhost.' });
   if (KEY || isRemote(req, PORT)) {
+    const secure = !!HOSTED || req.headers['x-forwarded-proto'] === 'https';
     const form = key === 'POST /signin';
-    const given = String((form ? (await readForm(req)).get('key') : url.searchParams.get('key')) || '').trim();
-    if (given && keyOk(given)) {
-      res.writeHead(303, { 'Set-Cookie': `ghb=${encodeURIComponent(given)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}`, Location: '/' });
-      return res.end();
-    }
-    if (given || form) { await sleep(700); return locked(req, res, url, true); } // slows guessing
-    const cookie = /(?:^|;\s*)ghb=([^;]+)/.exec(req.headers.cookie || '')?.[1];
-    let val = ''; try { val = decodeURIComponent(cookie || ''); } catch {}
-    if (!keyOk(val)) return locked(req, res, url, false);
+    // The hosted board takes the key only in a request body: an address can end up in history and logs.
+    const given = String((form ? (await readForm(req)).get('key') : !HOSTED && url.searchParams.get('key')) || '').trim();
+    try {
+      if (given || form) {
+        const r = await sessions.signIn(given, clientAddress(req, !!HOSTED));
+        if (r.token) {
+          res.writeHead(303, { 'Set-Cookie': [sessionCookie(r.token, secure), 'ghb=; Path=/; Max-Age=0'], Location: '/' }); // ghb: the old cookie that held the key
+          return res.end();
+        }
+        await sleep(700); // slows guessing
+        return locked(req, res, url, r.locked ? 'Too many attempts. Wait 15 minutes and try again.' : 'That key is not right.');
+      }
+      const token = readSessionCookie(req.headers.cookie);
+      if (!(await sessions.check(token, { touch: !req.headers['x-gh-background'] }))) return locked(req, res, url);
+      req.session = token;
+    } catch (e) { return json(res, 500, { error: redact(e.message || e) }); }
   }
   if (HOSTED) {
     const oidc = req.headers['x-vercel-oidc-token'];
@@ -887,7 +914,9 @@ export async function handler(req, res) {
     if (key === 'GET /') {
       if (await serveBuilt('/index.html', res)) return;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(await readFile(join(__dirname, 'public', 'index.html')));
+      const page = await readFile(join(__dirname, 'public', 'index.html'));
+      allowInlineScripts(res, page);
+      return res.end(page);
     }
     if (key === 'GET /api/download') {
       const d = downloads.get(q(url, 'id'));
@@ -906,12 +935,15 @@ export async function handler(req, res) {
     if (routes[key]) {
       const saves = !!vault && savesState(key);
       if (saves) vault.needDb();
-      const out = await routes[key](url, req.method === 'POST' ? await readBody(req) : undefined, req);
+      const body = req.method === 'POST' ? await readBody(req) : undefined;
+      if (HOSTED && /^POST \/api\/providers\/(save|add)$/.test(key)) checkHostedProvider(body);
+      const out = await routes[key](url, body, req);
       if (saves) {
         const sealed = vault.seal({ accounts: accounts.snapshot(), providers: snapshotProviders() });
         await vault.write(sealed);
         applied = sealed;
       }
+      if (req.endSession) res.setHeader('Set-Cookie', sessionCookie('', !!HOSTED || req.headers['x-forwarded-proto'] === 'https'));
       return json(res, 200, out);
     }
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && await serveBuilt(url.pathname, res)) return;

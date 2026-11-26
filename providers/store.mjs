@@ -176,6 +176,11 @@ export function saveProvider(id, patch = {}) {
   }
   if (patch.baseUrl !== undefined) {
     const raw = String(patch.baseUrl ?? '').trim();
+    // A saved key belongs to the server it was entered for: pointing the provider elsewhere forgets it.
+    const origin = (u) => { try { return new URL(u).origin; } catch { return ''; } };
+    const before = target.baseUrl || (b ? envUrls.get(id) || b.baseUrl : '');
+    const after = raw ? origin(checkBaseUrl(raw).url) : origin(b ? envUrls.get(id) || b.baseUrl : '');
+    if (origin(before) !== after && !String(patch.apiKey ?? '').trim()) delete target.apiKey;
     if (b && (!raw || checkBaseUrl(raw).url === b.baseUrl)) delete target.baseUrl;
     else target.baseUrl = checkBaseUrl(raw).url;
   }

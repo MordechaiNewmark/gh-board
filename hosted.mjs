@@ -27,6 +27,22 @@ const LOCAL_ONLY = /^POST \/api\/(runner\/|settings\/|auth\/device$|models\/|tun
 export const savesState = (key) => /^POST \/api\/(auth\/(token|logout|default|reconnect)|providers\/(save|add|remove)|repo\/account)$/.test(key);
 export const localOnlyRoute = (key) => LOCAL_ONLY.test(key);
 
+const PRIVATE_HOST = /^(localhost|.*\.(localhost|local|internal)|0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[)/i;
+
+/**
+ * Hosted, the server holds keys of its own (the AI Gateway token, project environment variables) and sits inside the
+ * platform's network. A provider saved through the UI must not be able to send those keys, or requests, elsewhere.
+ */
+export function checkHostedProvider(body = {}) {
+  const url = String(body.baseUrl ?? '').trim();
+  if (body.keyEnv) throw new Error('On the hosted board, paste the API key; environment variable names cannot be chosen here.');
+  if (body.id === GATEWAY_ID && (url || body.apiKey)) throw new Error('The Vercel AI Gateway provider is managed by the deployment.');
+  if (!url) return;
+  if (body.id === 'openai' || body.id === 'gemini') throw new Error('On the hosted board a built-in provider keeps its own address. Add a custom provider instead.');
+  let u; try { u = new URL(url); } catch { throw new Error('Base URL is not a valid URL.'); }
+  if (u.protocol !== 'https:' || PRIVATE_HOST.test(u.hostname)) throw new Error('On the hosted board the base URL must be a public https:// address.');
+}
+
 export const HOSTED_TOOLS_OFF = new Set(['sync_repo', 'run_loop_skill']);
 
 export const hostedNote = (repo) => `

@@ -15,6 +15,7 @@ server.err
 .chat-sessions.json
 .runner-bin/
 .tunnel.json*
+.sessions.json*
 .vercel
 
 .env*

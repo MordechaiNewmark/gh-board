@@ -7,8 +7,7 @@ export const readForm = (req) => new Promise((resolve) => {
   req.on('error', () => resolve(new URLSearchParams()));
 });
 
-export function locked(req, res, url, wrong) {
-  const message = wrong ? 'That key is not right.' : 'Locked. Enter your access key.';
+export function locked(req, res, url, message = 'Locked. Enter your access key.') {
   if (url.pathname.startsWith('/api/')) { res.writeHead(401, { 'Content-Type': 'text/plain' }); return res.end(message); }
   res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>gh-board sign in</title>

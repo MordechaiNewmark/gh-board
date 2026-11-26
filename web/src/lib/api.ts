@@ -33,8 +33,11 @@ export type Meta = { columns: string[]; prefix: string; labels: Label[]; milesto
 export type TreeEntry = { name: string; path: string; type: "dir" | "file"; size: number };
 export type RepoFile = { path: string; content: string; url: string; truncated?: boolean };
 
-export async function api<T = any>(path: string, body?: unknown): Promise<T> {
-  const r = await fetch(path, body === undefined ? undefined : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+/** `background` marks an automatic refresh, which does not keep the sign-in session alive. */
+export async function api<T = any>(path: string, body?: unknown, { background = false } = {}): Promise<T> {
+  const headers: Record<string, string> = { ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(background ? { "x-gh-background": "1" } : {}) };
+  const r = await fetch(path, body === undefined ? { headers } : { method: "POST", headers, body: JSON.stringify(body) });
+  if (r.status === 401) window.location.reload(); // the session ended: show the sign-in page
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j as T;
