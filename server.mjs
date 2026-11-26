@@ -10,8 +10,13 @@ import { z } from 'zod';
 import { EMPTY_DIR, parseRepo, checkoutDir, syncRepo, isSynced, guardTool, dropCheckout } from './repo-cache.mjs';
 import { createAccounts } from './accounts.mjs';
 import { createClaudeAuth } from './claude-auth.mjs';
-import { initProviders, providerRoutes, isClaude, runProviderChat, defineTool } from './providers/index.mjs';
+import { createTunnel, isRemote } from './tunnel.mjs';
+import { locked, readForm } from './signin.mjs';
+import { createVault } from './vault.mjs';
+import { initProviders, providerRoutes, isClaude, runProviderChat, defineTool, offerKey, snapshotProviders, restoreProviders } from './providers/index.mjs';
+import { isHosted, prepareHosted, localOnlyRoute, savesState, hostedNote, HOSTED_TOOLS_OFF, GATEWAY_ID, GATEWAY_KEY_ENV } from './hosted.mjs';
 import { createRunner } from './runner/index.mjs';
+import { RUNNABLE_SKILLS } from './runner/command.mjs';
 import { createLoopApi } from './loop/github.mjs';
 import { lintIssue } from './loop/lint.mjs';
 import { planBacklog, finalBody, finalLabels, epicBodyWithTasks, isEpicDraft, lintDrafts } from './loop/backlog.mjs';
@@ -21,7 +26,8 @@ import { modelPolicy, checkTiers, PRESETS, TIERS } from './loop/models.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(join(__dirname, '.env')); } catch {}
-initProviders(); // moves provider API keys (OPENAI_API_KEY, ...) out of process.env so no child process inherits them
+const HOSTED = isHosted() ? prepareHosted() : null;
+initProviders(HOSTED ? { file: HOSTED.providersFile } : undefined); // moves provider API keys (OPENAI_API_KEY, ...) out of process.env so no child process inherits them
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.STATUS_PREFIX || 'status:';
 const COLUMNS = (process.env.COLUMNS || 'Backlog,Todo,In progress,Review,Done').split(',').map((s) => s.trim()).filter(Boolean);
@@ -48,15 +54,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Several GitHub accounts can be connected at once (accounts.mjs). Every repo-scoped call below asks forRepo()
 // for a client bound to the account that owns that repo; there is no global token.
-const DATA_DIR = process.env.GH_BOARD_DATA_DIR || __dirname; // where .gh-accounts.json and .claude-auth.json live
+const DATA_DIR = HOSTED?.dir || process.env.GH_BOARD_DATA_DIR || __dirname; // where .gh-accounts.json and .claude-auth.json live
 const GITHUB_API = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
 const CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
 const accounts = createAccounts({
   dir: DATA_DIR, apiBase: GITHUB_API, readOnly: READ_ONLY,
   envToken: process.env.GITHUB_TOKEN || '',
   // The GitHub CLI session belongs to github.com: never send it to an overridden API host.
-  cliToken: () => (GITHUB_API === 'https://api.github.com' ? execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim() : ''),
+  cliToken: () => (!HOSTED && GITHUB_API === 'https://api.github.com' ? execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim() : ''),
 });
+const tunnel = createTunnel({ dir: DATA_DIR, port: PORT });
 const claudeAuth = createClaudeAuth({ dir: DATA_DIR, envFile: join(__dirname, '.env') });
 // The delivery loop: gh-board drives the delivery-loop plugin (runner/) and shows its state (loop/). See docs/PLATFORM.md.
 const runner = createRunner({
@@ -69,7 +76,7 @@ let device = null;
 async function authStatus() {
   const s = await accounts.status();
   const { method, label, source, tail, model, billing } = claudeAuth.status();
-  return { ...s, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, chatMode: PLANNER ? 'planner' : 'classic', plannerModel: chatModel(), claude: { method, label, source, tail, model, billing } };
+  return { ...s, hosted: !!HOSTED, database: !!vault?.configured, deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY, chatMode: PLANNER ? 'planner' : 'classic', plannerModel: chatModel(), claude: { method, label, source, tail, model, billing } };
 }
 async function connectToken(token) {
   const added = await accounts.addToken(token, 'token');
@@ -397,6 +404,31 @@ const issueIn = {
 };
 const R = z.string().describe('owner/name');
 
+// Tools that always show an approval card, even with "Auto-approve writes": they start agents that spend money and push branches.
+const ALWAYS_ASK = new Set(['run_loop_skill']);
+
+/**
+ * Run one real delivery-loop skill (implement, review, patch, decompose, ...) in the runner's sandbox and wait for it,
+ * streaming what the agent is doing into the chat. The chat's approval card is the confirmation the runner asks for.
+ */
+async function runLoopSkill(ctx, a) {
+  const repo = checkRepo(a.repo);
+  if (a.skill === 'delivery-tick') await runner.start(repo, { mode: 'once', confirm: true });
+  else if (a.skill === 'init') await runner.setup(repo, { confirm: true });
+  else await runner.runSkill(repo, { skill: a.skill, args: a.args, confirm: true });
+  let last = '';
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 2500));
+    if (ctx.signal?.aborted) { runner.stop(repo); throw new Error('Stopped: the chat was cancelled, so the run was stopped.'); }
+    const st = await runner.status(repo);
+    if (st.tick && st.tick.activity && st.tick.activity !== last) { last = st.tick.activity; ctx.send?.({ type: 'progress', tool: 'run_loop_skill', text: last }); }
+    if (!st.tick && st.status === 'idle') {
+      const t = st.lastTick || {};
+      return { skill: a.skill, ok: !!t.ok, error: t.error || undefined, turns: t.turns, costUsd: t.costUsd, did: t.did, denials: (t.denials || []).slice(0, 10), result: String(t.text || '').slice(0, 6000), note: 'This ran as a sandboxed agent session; check the issue or pull request on GitHub for the evidence.' };
+    }
+  }
+}
+
 const READ_NAMES = ['sync_repo', 'list_repos', 'list_issues', 'get_issue', 'list_sub_issues', 'list_labels', 'list_milestones', 'list_assignees', 'list_tree', 'read_file', 'search_code', 'generate_file', 'check_issues', 'use_skill'];
 // Planner drafts can name each other before they have numbers.
 const draftIn = { ...issueIn, key: z.string().optional().describe('Short id for this draft, unique in the call, so other drafts can depend on it'), depends_on: z.array(z.string()).optional().describe('Keys of drafts in this call and/or existing issues as "#12". The server writes the Depends-on line and the status label') };
@@ -406,6 +438,7 @@ function ghTools(ctx, T = defineTool) {
   const all = [
       T('list_repos', 'Repos the user can access, including ones they were invited to.', {}, () => listRepos()),
       T('list_issues', 'Issues with board column, labels, parent and sub-issue progress. Pass compact: true for a short list (number, title, state, labels, column, parent) when you only need to list or count issues.', { repo: R, state: z.enum(['open', 'closed', 'all']).default('open'), label: z.string().optional(), milestone: z.number().optional(), compact: z.boolean().default(false) }, async (a) => { const l = await listIssues(a.repo, a.state, a.label, a.milestone); return a.compact ? l.map(({ number, title, state, labels, column, parent, assignees }) => ({ number, title, state, labels, column, parent, assignees })) : l; }),
+      ...(PLANNER ? [T('run_loop_skill', `Run a real delivery-loop skill in the sandboxed runner and wait for it: ${Object.entries(RUNNABLE_SKILLS).map(([k, v]) => `${k} (${v.hint})`).join('; ')}; delivery-tick (one orchestrator tick); init (set the repo up for the loop). It can push branches and open pull requests, never merge. The user approves every run.`, { repo: R, skill: z.enum([...Object.keys(RUNNABLE_SKILLS), 'delivery-tick', 'init']), args: z.string().default('') }, (a) => runLoopSkill(ctx, a))] : []),
       ...(PLANNER ? [T('use_skill', 'Load the playbook that fits the user\'s ask. Call it before acting on a request; it returns the steps to follow.', { name: z.enum(skillNames()) }, (a) => { const k = getSkill(a.name); if (!k) throw new Error(`No skill ${a.name}`); return { skill: k.name, instructions: k.body }; })] : []),
       T('get_issue', 'One issue: full body, comments, parent and sub-issues.', { repo: R, number: z.number() }, (a) => getIssue(a.repo, a.number)),
       T('list_sub_issues', 'Children of an issue.', { repo: R, number: z.number() }, (a) => listSubIssues(a.repo, a.number)),
@@ -552,11 +585,11 @@ async function chat(req, res) {
 
   // The agent's working directory is the selected repo's checkout (created empty here; sync_repo fills it).
   let checkout = null, repoName = '';
-  try { repoName = parseRepo(repo).full; checkout = checkoutDir(repoName); } catch {}
+  try { repoName = parseRepo(repo).full; if (!HOSTED) checkout = checkoutDir(repoName); } catch {}
   const cwd = checkout || EMPTY_DIR;
-  mkdirSync(cwd, { recursive: true });
+  if (!HOSTED) mkdirSync(cwd, { recursive: true });
 
-  const ctx = { ...filesFor(chatId), send, repo: repoName, checkout };
+  const ctx = { ...filesFor(chatId), send, repo: repoName, checkout, signal: abort.signal };
   // The agent process gets one Claude credential (the method chosen in Settings) and no GitHub token at all:
   // GitHub calls happen in this process, through forRepo(), with the token of the account that owns the repo.
   const env = claudeAuth.agentEnv(process.env);
@@ -568,12 +601,15 @@ async function chat(req, res) {
   if (PLANNER && repoName) try { const r = await runner.readiness(repoName); loopCtx = { initialized: r.initialized, gateOk: r.gate.ok, ...r.conf }; } catch {}
 
   // Any provider other than Claude runs on the generic tool loop in providers/, with the same tools, prompt and approval gate.
-  if (!isClaude(provider)) {
+  // Hosted, the Agent SDK is not available: a chat set to "Claude" runs on Claude through the AI Gateway.
+  const viaGateway = HOSTED && isClaude(provider);
+  if (HOSTED || !isClaude(provider)) {
+    const prompt = systemPrompt(repoName || repo, checkout, '', loopCtx) + (HOSTED ? hostedNote(repoName) : '');
     try {
       await runProviderChat({
-        providerId: provider, model, sessionId, autoApprove, repoName, checkout, send, signal: abort.signal, pending, mine,
-        systemPrompt: systemPrompt(repoName || repo, checkout, '', loopCtx), content: buildPrompt(message, files, ctx.uploads),
-        defs: ghTools(ctx), readNames: READ_NAMES, previewTools: PREVIEW_TOOLS, readOnly: READ_ONLY, trunc,
+        providerId: viaGateway ? GATEWAY_ID : provider, model: viaGateway ? HOSTED.model : model, sessionId, autoApprove, repoName, checkout, send, signal: abort.signal, pending, mine,
+        systemPrompt: prompt, content: buildPrompt(message, files, ctx.uploads),
+        defs: ghTools(ctx).filter((d) => !HOSTED || !HOSTED_TOOLS_OFF.has(d.name)), readNames: READ_NAMES, previewTools: PREVIEW_TOOLS, readOnly: READ_ONLY, trunc,
         ensureSynced: async () => { if (!isSynced(repoName)) await syncCheckout(repoName, { onProgress: (text) => send({ type: 'progress', text }) }); },
       });
     } catch (e) { if (!abort.signal.aborted) send({ type: 'error', error: String(e.message || e) }); }
@@ -641,7 +677,7 @@ async function chat(req, res) {
             send({ type: 'approval', id: '', blocked: true, toolUseId: opts?.toolUseID, tool: name, input: preview });
             return { behavior: 'deny', message: 'Blocked: this server is in read-only mode (READ_ONLY=1). Do not retry; present the proposal in chat instead.' };
           }
-          if (autoApprove) return { behavior: 'allow', updatedInput: inp };
+          if (autoApprove && !ALWAYS_ASK.has(name)) return { behavior: 'allow', updatedInput: inp };
           const id = randomUUID();
           mine.add(id);
           send({ type: 'approval', id, toolUseId: opts?.toolUseID, tool: name, input: preview });
@@ -713,7 +749,13 @@ async function policyFor(repo) {
 }
 
 const q = (url, k) => url.searchParams.get(k);
+// Remote access settings change only from this computer: a remote session can neither widen nor re-key it.
+const localOnly = (req) => { if (isRemote(req, PORT)) throw new Error('Remote access can only be changed on the computer running gh-board.'); };
 const routes = {
+  'GET /api/tunnel': (url, body, req) => (HOSTED ? { hosted: true } : tunnel.status({ reveal: !isRemote(req, PORT) })),
+  'POST /api/tunnel/enable': (url, body, req) => { localOnly(req); if (body?.confirm !== true) throw new Error('Confirmation required: turning on remote access.'); return tunnel.enable(); },
+  'POST /api/tunnel/disable': (url, body, req) => { localOnly(req); return tunnel.disable(); },
+  'POST /api/tunnel/rotate': (url, body, req) => { localOnly(req); return tunnel.rotate(); },
   'GET /api/auth/status': () => authStatus(),
   // ?check=1 re-validates every token, so a revoked one shows as "needs attention".
   'GET /api/auth/accounts': async (u) => ({ ...(q(u, 'check') ? await accounts.check() : await accounts.list()), deviceFlow: !!CLIENT_ID, device, readOnly: READ_ONLY }),
@@ -768,6 +810,7 @@ const routes = {
   'GET /api/runner/log': async (u) => { const repo = checkRepo(q(u, 'repo')); const ticks = await runner.history(repo); const id = q(u, 'tick') || ticks[0]; return { ticks, tick: id || null, events: id ? await runner.log(repo, id) : [] }; },
   'POST /api/runner/start': (u, b) => runner.start(checkRepo(b.repo), { mode: b.mode, confirm: b.confirm }),
   'POST /api/runner/setup': (u, b) => runner.setup(checkRepo(b.repo), { confirm: b.confirm }),
+  'POST /api/runner/skill': (u, b) => runner.runSkill(checkRepo(b.repo), { skill: b.skill, args: b.args, confirm: b.confirm }),
   'POST /api/runner/stop': (u, b) => runner.stop(checkRepo(b.repo)),
   'POST /api/runner/stop-all': () => runner.stopAll(),
   'POST /api/runner/pause': (u, b) => runner.pause(checkRepo(b.repo)),
@@ -790,31 +833,57 @@ async function serveBuilt(pathname, res) {
 }
 
 const HOST = process.env.HOST || '127.0.0.1';
-const KEY = process.env.ACCESS_KEY || '';
+const KEY = (process.env.ACCESS_KEY || '').trim(); // a pasted value often carries a trailing space or newline
 const LOCAL = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, ...(process.env.ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean)]);
 const sha = (v) => createHash('sha256').update(String(v)).digest();
-const keyOk = (v) => !!v && timingSafeEqual(sha(v), sha(KEY));
-if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) && KEY.length < 12) {
+// ACCESS_KEY (.env) guards every request. The tunnel key (Settings > Remote access) guards remote ones.
+const keyOk = (v) => !!v && [KEY, tunnel.key()].some((k) => !!k && timingSafeEqual(sha(v), sha(k)));
+if (!HOSTED && !['127.0.0.1', 'localhost', '::1'].includes(HOST) && KEY.length < 12) {
   console.error('HOST is not loopback: set ACCESS_KEY (12+ characters) in .env so only you can open the board.');
   process.exit(1);
 }
 
-const server = http.createServer(async (req, res) => {
+// Hosted: accounts and provider keys added in the UI live in the database. Each request loads the current copy.
+const vault = HOSTED ? createVault(KEY) : null;
+const BASE_PROVIDERS = HOSTED ? snapshotProviders() : null;
+let applied = ''; // the stored entry this instance currently holds
+async function useStored() {
+  const sealed = await vault.read();
+  if (sealed === applied) return;
+  const state = sealed ? vault.open(sealed) : null;
+  await accounts.restore(state?.accounts);
+  restoreProviders(state?.providers || BASE_PROVIDERS);
+  applied = sealed;
+}
+
+export async function handler(req, res) {
   const url = new URL(req.url, 'http://x');
   const key = `${req.method} ${url.pathname}`;
   const origin = req.headers.origin;
-  if (!LOCAL.has(req.headers.host) || (origin && !LOCAL.has(origin.replace(/^https?:\/\//, '')))) return json(res, 403, { error: 'Requests are only accepted from this app on localhost.' });
-  if (KEY) {
-    const given = url.searchParams.get('key');
+  // Hosted, the platform only routes this deployment's own domains here, so the page must just match the host.
+  const allowed = (h) => (HOSTED ? !!h && h === req.headers.host : LOCAL.has(h) || (!!h && h === tunnel.host()));
+  if (HOSTED && KEY.length < 12) return json(res, 503, { error: 'Not set up yet: add an ACCESS_KEY environment variable (12+ characters) to this Vercel project, then redeploy.' });
+  if (!allowed(req.headers.host) || (origin && !allowed(origin.replace(/^https?:\/\//, '')))) return json(res, 403, { error: 'Requests are only accepted from this app on localhost.' });
+  if (KEY || isRemote(req, PORT)) {
+    const form = key === 'POST /signin';
+    const given = String((form ? (await readForm(req)).get('key') : url.searchParams.get('key')) || '').trim();
     if (given && keyOk(given)) {
-      res.writeHead(302, { 'Set-Cookie': `ghb=${encodeURIComponent(given)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`, Location: '/' });
+      res.writeHead(303, { 'Set-Cookie': `ghb=${encodeURIComponent(given)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}`, Location: '/' });
       return res.end();
     }
+    if (given || form) { await sleep(700); return locked(req, res, url, true); } // slows guessing
     const cookie = /(?:^|;\s*)ghb=([^;]+)/.exec(req.headers.cookie || '')?.[1];
     let val = ''; try { val = decodeURIComponent(cookie || ''); } catch {}
-    if (!keyOk(val)) { res.writeHead(401, { 'Content-Type': 'text/plain' }); return res.end('Locked. Open this address once with ?key=YOUR_ACCESS_KEY'); }
+    if (!keyOk(val)) return locked(req, res, url, false);
+  }
+  if (HOSTED) {
+    const oidc = req.headers['x-vercel-oidc-token'];
+    if (oidc) offerKey(GATEWAY_KEY_ENV, String(oidc));
+    if (localOnlyRoute(key)) return json(res, 403, { error: 'Not available on the hosted board. Do this on the board running on your computer, or set it in the Vercel environment variables.' });
   }
   try {
+    // Pages and files do not need the database, so an outage cannot hide the UI.
+    if (vault && url.pathname.startsWith('/api/')) await useStored();
     if (key === 'GET /') {
       if (await serveBuilt('/index.html', res)) return;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -828,20 +897,34 @@ const server = http.createServer(async (req, res) => {
     }
     if (key === 'POST /api/approve') {
       const { id, ok: approved } = await readBody(req);
+      // Hosted, a request can reach another server instance than the chat that is waiting: say so instead of "ok".
+      if (HOSTED && !pending.has(id)) return json(res, 409, { error: 'This approval could not be delivered. Stop the reply and send your message again.' });
       pending.get(id)?.(!!approved);
       return json(res, 200, { ok: true });
     }
     if (key === 'POST /api/chat') return await chat(req, res);
-    if (routes[key]) return json(res, 200, await routes[key](url, req.method === 'POST' ? await readBody(req) : undefined));
+    if (routes[key]) {
+      const saves = !!vault && savesState(key);
+      if (saves) vault.needDb();
+      const out = await routes[key](url, req.method === 'POST' ? await readBody(req) : undefined, req);
+      if (saves) {
+        const sealed = vault.seal({ accounts: accounts.snapshot(), providers: snapshotProviders() });
+        await vault.write(sealed);
+        applied = sealed;
+      }
+      return json(res, 200, out);
+    }
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && await serveBuilt(url.pathname, res)) return;
     json(res, 404, { error: 'not found' });
   } catch (e) {
+    if (vault && savesState(key)) applied = null; // memory may be ahead of the database: reload next time
     if (!res.headersSent) json(res, 500, { error: redact(e.message || e) });
     else res.end();
   }
-});
+}
 
-server.listen(PORT, HOST, () => {
+// Hosted, the platform calls handler() for each request and nothing listens here.
+if (!HOSTED) http.createServer(handler).listen(PORT, HOST, () => {
   console.log(`gh-board running at http://localhost:${PORT}`);
   const ca = claudeAuth.status();
   console.log(`Claude auth: ${ca.label} (${ca.source === 'saved' ? 'chosen in Settings' : ca.source === 'env' ? 'from .env' : 'default'})${ca.billing === 'api' ? ' - billed to the Anthropic API account' : ''}`);

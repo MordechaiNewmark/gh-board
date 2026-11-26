@@ -6,12 +6,12 @@
 //   defineTool           the plain tool-definition helper shared with the MCP server
 import { randomUUID } from 'node:crypto';
 import { CLAUDE_ID, checkModel } from './registry.mjs';
-import { initProviders, publicView, saveProvider, addCustom, removeProvider, resolveProvider } from './store.mjs';
+import { initProviders, offerKey, snapshotProviders, restoreProviders, publicView, saveProvider, addCustom, removeProvider, resolveProvider } from './store.mjs';
 import { buildTools, defineTool } from './tools.mjs';
 import { runAgentLoop, adapterFor } from './agent-loop.mjs';
 import { ProviderError, scrub } from './http.mjs';
 
-export { initProviders, defineTool };
+export { initProviders, defineTool, offerKey, snapshotProviders, restoreProviders };
 export const isClaude = (id) => !id || id === CLAUDE_ID;
 
 /* ----------------------------- settings API ----------------------------- */
@@ -131,7 +131,7 @@ export async function runProviderChat({
       send({ type: 'approval', id: '', blocked: true, toolUseId: callId, tool: tool.name, input: preview });
       return { allow: false, message: 'Blocked: this server is in read-only mode (READ_ONLY=1). Do not retry; present the proposal in chat instead.' };
     }
-    if (autoApprove) return { allow: true };
+    if (autoApprove && tool.name !== 'run_loop_skill') return { allow: true };
     const approvalId = randomUUID();
     mine.add(approvalId);
     send({ type: 'approval', id: approvalId, toolUseId: callId, tool: tool.name, input: preview });

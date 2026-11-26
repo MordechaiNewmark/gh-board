@@ -1,0 +1,15 @@
+/*
+!/package.json
+!/package-lock.json
+!/vercel.json
+!/*.mjs
+!/api
+!/loop
+!/providers
+!/runner
+!/public
+!/static
+!/web
+/web/node_modules
+/web/dist
+.env*

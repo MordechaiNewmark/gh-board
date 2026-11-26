@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { CircleAlertIcon, CircleCheckIcon, Loader2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ProvidersSection } from "./settings/ProvidersSection";
+import { TunnelSection } from "./settings/TunnelSection";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -150,6 +151,9 @@ export function SettingsDialog({ open, onOpenChange, onChanged }: Props) {
         </form>
         <div className="border-t pt-4">
           <ProvidersSection />
+        </div>
+        <div className="border-t pt-4">
+          <TunnelSection open={open} />
         </div>
       </DialogContent>
     </Dialog>

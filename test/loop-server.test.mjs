@@ -184,7 +184,7 @@ test('planner chat: issues only. No commit tool, and create_issues builds a back
 
   // What the model was told: the planner prompt, with the gate and modules of this repo.
   const sys = llm.log.find((e) => e.script === 'planner').body.messages[0].content;
-  assert.match(sys, /ONLY thing you produce is GitHub issues/);
+  assert.match(sys, /what you produce directly is GitHub issues/);
   assert.match(sys, /Modules \(MODULES\): module:api, module:web, module:reports/);
   assert.ok(!llm.log.some((e) => (e.body?.tools || []).some((t) => (t.function?.name || t.name) === 'commit_file')), 'commit_file is not in the tool list sent to the model');
 

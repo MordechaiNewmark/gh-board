@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm install --omit=optional && npm --prefix web install",
+  "buildCommand": "npm --prefix web run build",
+  "outputDirectory": "static",
+  "functions": {
+    "api/index.mjs": {
+      "maxDuration": 300,
+      "includeFiles": "{web/dist,public,loop/skills}/**",
+      "excludeFiles": "node_modules/@anthropic-ai/claude-agent-sdk-*/**"
+    }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }]
+}

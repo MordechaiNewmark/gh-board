@@ -22,7 +22,7 @@ export type ClaudeSettings = ClaudeBrief & {
 };
 /** The default account fills login/avatar/source (the pre-multi-account shape); accounts lists all of them. */
 export type Auth = {
-  connected: boolean; login?: string; avatar?: string; source?: string; deviceFlow?: boolean;
+  connected: boolean; login?: string; avatar?: string; source?: string; deviceFlow?: boolean; hosted?: boolean; database?: boolean;
   device?: { status: string; error?: string; login?: string } | null; error?: string; readOnly?: boolean;
   accounts?: Account[]; hidden?: HiddenAccount[]; notices?: string[]; claude?: ClaudeBrief; chatMode?: "planner" | "classic"; plannerModel?: string;
 };

@@ -13,3 +13,10 @@ server.log
 .runner.json*
 server.err
 .chat-sessions.json
+.runner-bin/
+.tunnel.json*
+.vercel
+
+.env*
+
+!.env.example

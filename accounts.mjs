@@ -36,20 +36,30 @@ export function createAccounts({ dir, apiBase = 'https://api.github.com', envTok
   function load() {
     if (!existsSync(FILE)) return;
     try {
-      const j = JSON.parse(readFileSync(FILE, 'utf8'));
-      store = {
-        version: 1,
-        default: typeof j.default === 'string' ? j.default : '',
-        accounts: (Array.isArray(j.accounts) ? j.accounts : []).filter((a) => a && typeof a.login === 'string' && typeof a.token === 'string' && a.token)
-          .map((a) => ({ login: a.login, avatar: a.avatar || '', token: a.token, source: a.source === 'device' ? 'device' : 'token', addedAt: a.addedAt || new Date().toISOString() })),
-        overrides: j.overrides && typeof j.overrides === 'object' ? { ...j.overrides } : {},
-        ignored: Array.isArray(j.ignored) ? j.ignored.map(low) : [],
-      };
+      store = parseStore(JSON.parse(readFileSync(FILE, 'utf8')));
     } catch {
       // Keep the unreadable file for the owner to inspect; start empty rather than crash.
       try { renameSync(FILE, `${FILE}.bad`); } catch {}
       notices.push('.gh-accounts.json could not be read and was set aside as .gh-accounts.json.bad. Reconnect your accounts.');
     }
+  }
+  function parseStore(j) {
+    return {
+      version: 1,
+      default: typeof j?.default === 'string' ? j.default : '',
+      accounts: (Array.isArray(j?.accounts) ? j.accounts : []).filter((a) => a && typeof a.login === 'string' && typeof a.token === 'string' && a.token)
+        .map((a) => ({ login: a.login, avatar: a.avatar || '', token: a.token, source: a.source === 'device' ? 'device' : 'token', addedAt: a.addedAt || new Date().toISOString() })),
+      overrides: j?.overrides && typeof j.overrides === 'object' ? { ...j.overrides } : {},
+      ignored: Array.isArray(j?.ignored) ? j.ignored.map(low) : [],
+    };
+  }
+  /** The saved accounts, tokens included: server-side only (the hosted board encrypts this into its database). */
+  const snapshot = () => structuredClone(store);
+  /** Replace the saved accounts in memory (null = none). */
+  async function restore(saved) {
+    await init();
+    store = parseStore(saved);
+    health.clear(); index = new Map(); invalidate();
   }
   function save() {
     const tmp = `${FILE}.tmp`;
@@ -365,7 +375,7 @@ export function createAccounts({ dir, apiBase = 'https://api.github.com', envTok
   }
 
   return {
-    init, list, addToken, remove, reconnect, setDefault, check, listRepos, accountFor, forRepo, repoAccount, setRepoAccount, scrub,
+    init, snapshot, restore, list, addToken, remove, reconnect, setDefault, check, listRepos, accountFor, forRepo, repoAccount, setRepoAccount, scrub,
     /** Compatibility shape of the old single-account status: the default account. */
     async status() {
       const l = await list();

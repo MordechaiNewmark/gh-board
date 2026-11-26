@@ -37,6 +37,13 @@ export function initProviders({ env = process.env, file } = {}) {
 
 export const providersFile = () => FILE;
 
+/** A short-lived key the platform hands over per request. A key set by the user wins. */
+const offered = new Set();
+export function offerKey(name, key) {
+  if (envKeys.has(name) && !offered.has(name)) return;
+  offered.add(name); envKeys.set(name, key);
+}
+
 /* ------------------------------ persistence ----------------------------- */
 
 const blank = () => ({ version: 1, providers: {}, custom: [] });
@@ -65,6 +72,10 @@ export function fileTooOpen() {
   if (process.platform === 'win32') return false;
   try { return (statSync(FILE).mode & 0o077) !== 0; } catch { return false; }
 }
+
+/** The saved settings, keys included: server-side only (the hosted board encrypts this into its database). */
+export const snapshotProviders = () => load();
+export const restoreProviders = (state) => persist(state);
 
 /* -------------------------------- views --------------------------------- */
 

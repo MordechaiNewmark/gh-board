@@ -151,7 +151,7 @@ export function AuthDialog({ open, auth, onOpenChange, onChanged }: Props) {
               <p id="gh-token-help" className="text-xs leading-relaxed text-muted-foreground">
                 Use a classic token with <code className="rounded bg-secondary px-1 font-mono text-foreground">repo</code> and <code className="rounded bg-secondary px-1 font-mono text-foreground">read:org</code> so repos you were invited to show up.{" "}
                 <a className="font-medium text-brand underline underline-offset-2" href="https://github.com/settings/tokens/new?scopes=repo,read:org&description=gh-board" target="_blank" rel="noopener">Create one on GitHub</a>{" "}
-                while signed in as the account you want to add. If an org uses SSO, authorize the token for it. A token for an account that is already connected replaces its old token. Tokens are saved only on the computer running gh-board.
+                while signed in as the account you want to add. If an org uses SSO, authorize the token for it. A token for an account that is already connected replaces its old token. {auth.hosted ? (auth.database ? "On this hosted board the token is stored encrypted in its database." : "No database is connected yet, so a token cannot be saved here.") : "Tokens are saved only on the computer running gh-board."}
               </p>
               {error && <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[13px] text-destructive">{error}</p>}
               <DialogFooter className="mt-2">

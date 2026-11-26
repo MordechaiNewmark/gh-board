@@ -91,9 +91,11 @@ test('argv: the plugin tick, restrictive permissions, no bypass flag, and no sec
 test('allowlist: git, gh, jq, the gate, the setup command and the plugin scripts; network tools and merges denied', () => {
   const conf = { GATE_CMD: 'bash scripts/check.sh', WORKTREE_SETUP_CMD: 'npm ci' };
   const sup = permissions({ kind: 'tick', autonomy: 'supervised', conf });
-  for (const r of ['Bash(git *)', 'Bash(gh *)', 'Bash(jq *)', 'Bash(bash scripts/check.sh)', 'Bash(bash scripts/check.sh *)', 'Bash(npm ci)', 'Bash(bash *scripts/task-queue.sh *)', 'Bash(bash *scripts/claim-task.sh" *)', 'Bash(bash *scripts/task-worktree.sh *)', 'Skill', 'Task', 'Read', 'Edit', 'Write', 'Glob', 'Grep'])
+  for (const r of ['Bash(git *)', 'Bash(gh *)', 'Bash(jq *)', 'Bash(bash scripts/check.sh)', 'Bash(bash scripts/check.sh *)', 'Bash(npm ci)', 'Bash(cd *)', 'Bash(cat *)', 'Bash(bash *task-queue.sh *)', 'Bash(bash *claim-task.sh" *)', 'Bash(bash *task-worktree.sh *)', 'Skill', 'Task', 'Read', 'Edit', 'Write', 'Glob', 'Grep'])
     assert.ok(sup.allow.includes(r), `allows ${r}`);
-  assert.ok(!sup.allow.some((r) => /^Bash\((\*\)|bash \*\)|sh |npm \*|node|curl|python|powershell|cmd)/i.test(r) || r === 'Bash'), 'no blanket shell');
+  assert.ok(!sup.allow.some((r) => /^Bash\((\*\)|bash \*\)|sh |curl|wget|powershell|cmd)/i.test(r) || r === 'Bash'), 'no blanket shell');
+  for (const r of ['Bash(uv *)', 'Bash(pnpm *)', 'Bash(npm *)']) assert.ok(sup.allow.includes(r), `dev toolchain: ${r}`);
+  for (const r of ['Bash(npm publish *)', 'Bash(pnpm publish *)', 'Bash(uv publish *)']) assert.ok(sup.deny.includes(r), `never publishes: ${r}`);
   assert.ok(!sup.allow.some((r) => /delivery-init/.test(r)), 'the init script is not reachable from a tick');
   for (const t of ['WebFetch', 'WebSearch', ...DENIED_TOOLS]) assert.ok(sup.deny.includes(t), `denies ${t}`);
   for (const r of ['Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh api *)', 'Bash(gh repo delete *)', 'Bash(gh repo create *)', 'Bash(gh auth *)', 'Bash(gh secret *)', 'Bash(git push --force *)', 'Bash(git config --global *)'])
@@ -103,7 +105,7 @@ test('allowlist: git, gh, jq, the gate, the setup command and the plugin scripts
   assert.ok(!auto.deny.some((r) => /gh pr merge/.test(r)), 'only auto-merge may merge');
   assert.ok(auto.deny.includes('Bash(gh api *)'));
   const init = permissions({ kind: 'init', autonomy: 'auto', conf: {} });
-  assert.ok(init.allow.includes('Bash(bash *scripts/delivery-init.sh *)') && init.deny.includes('Bash(gh pr merge *)') && init.deny.includes('Bash(gh repo create *)'));
+  assert.ok(init.allow.includes('Bash(bash *delivery-init.sh *)') && init.deny.includes('Bash(gh pr merge *)') && init.deny.includes('Bash(gh repo create *)'));
 });
 
 test('env: exactly one GitHub token, at most one Claude credential, nothing else that looks like a secret', () => {
@@ -311,7 +313,7 @@ test('setup: runs /delivery-loop:init through the same runner, only after confir
   const st = await r.idle('acme/fresh');
   const d = r.dump();
   assert.equal(d.argv[1], '/delivery-loop:init');
-  assert.ok(d.argv.includes('Bash(bash *scripts/delivery-init.sh *)') && d.argv.includes('Bash(gh pr merge *)') && d.argv.includes('Bash(gh repo create *)'));
+  assert.ok(d.argv.includes('Bash(bash *delivery-init.sh *)') && d.argv.includes('Bash(gh pr merge *)') && d.argv.includes('Bash(gh repo create *)'));
   assert.match(d.argv[d.argv.indexOf('--append-system-prompt') + 1], /open a pull request titled "Set up the delivery loop".*never merge/s);
   assert.deepEqual([st.lastTick.kind, st.lastTick.ok, st.mode], ['init', true, '']);
 });
@@ -338,4 +340,53 @@ test('model choice per repo is local; "Test models" runs one tiny no-tool prompt
   assert.equal(d.env.ANTHROPIC_API_KEY, GOOD_KEY);
   assert.ok(!d.cwd.toLowerCase().includes('.workspaces'), 'it does not run inside a repository');
   assert.equal(mock.log.length, before, 'and it does not touch GitHub');
+});
+
+test('skill run: the chat can launch one plugin skill; arguments are validated first, it needs confirmation, and it can never merge', async () => {
+  const r = await make();
+  await assert.rejects(r.runner.runSkill('acme/timesheet', { skill: 'review-task', args: '17' }), /Confirmation required/);
+  await assert.rejects(r.runner.runSkill('acme/timesheet', { skill: 'review-task', args: '17; rm -rf /', confirm: true }), /not a valid argument/);
+  await assert.rejects(r.runner.runSkill('acme/timesheet', { skill: 'delivery-tick', confirm: true }), /Unknown skill/);
+  await r.runner.runSkill('acme/timesheet', { skill: 'review-task', args: '17', confirm: true });
+  const st = await r.idle('acme/timesheet');
+  const d = r.dump();
+  assert.equal(d.argv[1], '/delivery-loop:review-task 17');
+  assert.ok(d.argv.indexOf('Bash(gh pr merge *)') > d.argv.indexOf('--disallowedTools'), 'merging is denied in a skill session');
+  assert.equal(d.env.GH_TOKEN, TOK.alice);
+  assert.deepEqual([st.lastTick.kind, st.lastTick.ok, st.mode], ['skill', true, '']);
+  const ro = await make({ readOnly: true });
+  await assert.rejects(ro.runner.runSkill('acme/timesheet', { skill: 'review-task', args: '17', confirm: true }), /READ_ONLY=1/);
+});
+
+test('jq shim: on Windows a `jq -b` wrapper is put first on PATH (CRLF breaks the plugin scripts); elsewhere nothing', async () => {
+  const { jqShim } = await import('../runner/command.mjs');
+  const { mkdtempSync, mkdirSync: mk, writeFileSync: wf, readFileSync: rf, existsSync: ex } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { delimiter: sep } = await import('node:path');
+  const root = mkdtempSync(join(tmpdir(), 'jqshim-'));
+  mk(join(root, 'bin'), { recursive: true }); wf(join(root, 'bin', 'jq.exe'), '');
+  assert.equal(jqShim({ dir: join(root, 'shim'), env: { PATH: join(root, 'bin') }, platform: 'linux' }), null);
+  assert.equal(jqShim({ dir: join(root, 'shim'), env: { Path: join(root, 'nothing') }, platform: 'win32' }), null, 'no jq found: nothing to wrap');
+  assert.equal(jqShim({ dir: join(root, 'shim'), env: { Path: ['x', join(root, 'bin')].join(sep) }, platform: 'win32' }), join(root, 'shim'));
+  const w = rf(join(root, 'shim', 'jq'), 'utf8');
+  assert.match(w, /^#!\/usr\/bin\/env bash\n/);
+  assert.match(w, /exec ".*jq\.exe" -b "\$@"/);
+  assert.ok(!w.includes('\\'), 'the path in the wrapper is POSIX style');
+  assert.ok(ex(join(root, 'shim', 'jq')));
+});
+
+test('the session is told not to use command substitution, and given an agent id to use in its place', async () => {
+  const { buildArgs, substitutionNote } = await import('../runner/command.mjs');
+  assert.match(substitutionNote(1700000000000), /agent-1700000000 instead/);
+  const note = buildArgs({ kind: 'tick' })[buildArgs({ kind: 'tick' }).indexOf('--append-system-prompt') + 1];
+  assert.match(note, /command substitution/);
+});
+
+test('RUNNER_PATH_PREPEND puts the configured directories first on the session PATH', async () => {
+  const r = await make({ env: { RUNNER_PATH_PREPEND: ['/opt/node26', '/opt/tools'].join(process.platform === 'win32' ? ';' : ':') } });
+  await r.runner.start('acme/timesheet', { mode: 'once', confirm: true });
+  await r.idle('acme/timesheet');
+  const d = r.dump();
+  const p = d.env.PATH || d.env.Path;
+  assert.ok(p.startsWith(['/opt/node26', '/opt/tools'].join(process.platform === 'win32' ? ';' : ':')) || p.split(process.platform === 'win32' ? ';' : ':').slice(0, 3).includes('/opt/node26'), 'the configured directories lead PATH');
 });

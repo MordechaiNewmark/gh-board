@@ -6,11 +6,11 @@
 import { spawn } from 'node:child_process';
 import { appendFile, mkdir, readFile, readdir } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { parseRepo } from '../repo-cache.mjs';
 import { parseConf, gateStatus, readiness, modulesOf as confModules, CONF_PATH } from '../loop/conf.mjs';
 import { checkPlugin } from './plugin.mjs';
-import { AUTONOMY, buildArgs, buildEnv, permissions, promptFor, resolveClaude, tokenKind, splitList } from './command.mjs';
+import { AUTONOMY, RUNNABLE_SKILLS, buildArgs, buildEnv, permissions, promptFor, jqShim, resolveClaude, skillPrompt, tokenKind, splitList } from './command.mjs';
 import { makeScrubber, parseStreamObject, effectOf, lineSplitter } from './log.mjs';
 import { createWorkspaces, apiReader } from './workspace.mjs';
 import { PRESETS, DEFAULT_PRESET, TIERS, checkTiers } from '../loop/models.mjs';
@@ -132,14 +132,14 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
   const capCheck = (key) => { if (day(key).ticks >= lim.dailyTicks) throw new Error(`Daily cap reached: ${lim.dailyTicks} ticks today for this repository (RUNNER_DAILY_TICKS).`); };
 
   /** Prepare the workspace and (for ticks) prove there is a gate. Returns what the session needs. */
-  async function prepare(repo, kind) {
+  async function prepare(repo, kind, { gate: needGate = kind === 'tick' } = {}) {
     const { full } = parseRepo(repo);
     const acct = await accounts.forRepo(full);
     const info = await acct.gh(`/repos/${full}`);
     const ws = await workspaces.ensure(full, { token: acct.token, branch: info.default_branch || 'main' });
     const reader = workspaces.reader(full);
     const parsed = parseConf(await reader.read(CONF_PATH));
-    if (kind === 'tick') {
+    if (needGate) {
       if ((await reader.read(CONF_PATH)) === null) throw new Error('This repository is not set up for the delivery loop (no .claude/delivery.conf on the base branch). Run "Set up this repo" first.');
       const gate = await gateStatus(reader, parsed);
       if (!gate.ok) throw new Error(`No gate: ${gate.reason} The loop will not run without one. Use "Set up this repo", then review scripts/check.sh.`);
@@ -163,13 +163,17 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
   }
 
   /** Run one session to completion. Resolves with a summary; never rejects for a failed tick. */
-  async function runSession(repo, key, kind) {
+  async function runSession(repo, key, kind, extra = {}) {
     const s = state(key); const c = cfg(key);
-    const { acct, ws, conf } = await prepare(repo, kind);
+    const { acct, ws, conf } = await prepare(repo, kind, { gate: kind === 'tick' || (kind === 'skill' && RUNNABLE_SKILLS[extra.skill]?.gate) });
     const bin = resolveClaude({ env });
-    const autonomy = kind === 'tick' ? c.autonomy : 'supervised';
-    const args = buildArgs({ kind, autonomy, parallel: c.parallel, conf, maxTurns: lim.maxTurns, model: env.RUNNER_MODEL || '', budgetUsd: lim.budgetUsd, extraAllow });
+    const autonomy = kind === 'tick' ? c.autonomy : 'supervised'; // skill sessions never merge
+    const args = buildArgs({ kind, autonomy, parallel: c.parallel, conf, maxTurns: lim.maxTurns, model: env.RUNNER_MODEL || '', budgetUsd: lim.budgetUsd, extraAllow, skill: extra.skill, skillArgs: extra.args });
     const childEnv = buildEnv({ base: env, token: acct.token, claudeEnv: claudeAuth.agentEnv({}), pass: envPass, apiHost });
+    // RUNNER_PATH_PREPEND: directories put first on PATH for agent sessions (for example the Node version a repo's `engines` asks for).
+    const prepend = String(env.RUNNER_PATH_PREPEND || '').split(delimiter).map((x) => x.trim()).filter(Boolean);
+    if (prepend.length) { const k = Object.keys(childEnv).find((x) => x.toLowerCase() === 'path') || 'PATH'; childEnv[k] = `${prepend.join(delimiter)}${delimiter}${childEnv[k] || ''}`; }
+    try { const shim = jqShim({ dir: join(dataDir, '.runner-bin'), env: childEnv }); if (shim) { const k = Object.keys(childEnv).find((x) => x.toLowerCase() === 'path') || 'PATH'; childEnv[k] = `${shim}${delimiter}${childEnv[k] || ''}`; } } catch {}
     const scrub = makeScrubber([acct.token, childEnv.ANTHROPIC_API_KEY, childEnv.CLAUDE_CODE_OAUTH_TOKEN], (x) => claudeAuth.scrub(accounts.scrub(x)));
 
     const id = new Date().toISOString().replace(/[:.]/g, '-');
@@ -177,7 +181,7 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
     const t = { id, kind, startedAt: new Date().toISOString(), activity: 'Starting Claude Code…', model: '', turns: 0, events: [], file: join(runsDir(repo), `${id}.jsonl`), write: Promise.resolve(), prompt: args[1], tools: new Map(), did: { dispatched: 0, prOpened: 0, merged: 0, escalation: 0 } };
     s.tick = t; s.status = 'running'; s.lastError = '';
     day(key).ticks += 1; c.counters.ticks += 1; save();
-    record(t, scrub, { type: 'note', text: `${kind === 'init' ? 'Setup' : 'Tick'} started as @${acct.login} in ${autonomy} mode: ${args[1]}${ws.warning ? ` · ${ws.warning}` : ''}` });
+    record(t, scrub, { type: 'note', text: `${kind === 'init' ? 'Setup' : kind === 'skill' ? 'Skill run' : 'Tick'} started as @${acct.login} in ${autonomy} mode: ${args[1]}${ws.warning ? ` · ${ws.warning}` : ''}` });
     onChange(repo);
 
     return new Promise((done) => {
@@ -221,7 +225,7 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
         const stopped = s.stopping;
         const error = spawnError ? scrub(spawnError.message) : stopped ? 'Stopped.' : timedOut ? 'Timed out.' : pluginMissing ? 'The delivery-loop plugin did not load.' : result?.isError ? (result.text || result.subtype || 'The session ended with an error.') : !result ? `Claude Code exited with code ${code} before finishing.` : '';
         const summary = { id, kind, startedAt: t.startedAt, endedAt: new Date().toISOString(), ok: !error, error: String(error).slice(0, 600), stopped, turns: result?.turns || 0, costUsd: cost, did: t.did, idle: !error && t.did.dispatched === 0 && t.did.merged === 0, denials: result?.denials || [], text: scrub(result?.text || '').slice(0, 3000) };
-        record(t, scrub, { type: 'note', text: `${kind === 'init' ? 'Setup' : 'Tick'} ${error ? `ended: ${summary.error}` : summary.idle ? 'finished: nothing to dispatch.' : 'finished.'}` });
+        record(t, scrub, { type: 'note', text: `${kind === 'init' ? 'Setup' : kind === 'skill' ? 'Skill run' : 'Tick'} ${error ? `ended: ${summary.error}` : summary.idle ? 'finished: nothing to dispatch.' : 'finished.'}` });
         await t.write;
         s.child = null; s.tick = null; s.lastTick = { ...summary, events: t.events.slice(-80) };
         save(); onChange(repo);
@@ -232,12 +236,12 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
     });
   }
 
-  async function loop(repo, key, kind) {
+  async function loop(repo, key, kind, extra = {}) {
     const s = state(key);
     for (;;) {
       if (s.stopping) break;
       let summary;
-      try { capCheck(key); summary = await runSession(repo, key, kind); }
+      try { capCheck(key); summary = await runSession(repo, key, kind, extra); }
       catch (e) { s.lastError = claudeAuth.scrub(accounts.scrub(String(e.message || e))); break; }
       if (s.stopping || s.mode !== 'continuous' || kind !== 'tick') break;
       if (!summary.ok) { s.lastError = `Stopped after a failed tick: ${summary.error}`; break; } // never loop on errors
@@ -284,6 +288,23 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
     s.status = 'starting'; s.mode = 'setup'; s.stopping = false; s.paused = false; s.lastError = '';
     try { await prepare(full, 'init'); resolveClaude({ env }); } catch (e) { s.status = 'idle'; s.mode = ''; throw e; }
     void loop(full, key, 'init');
+    await new Promise((r) => setTimeout(r, 30));
+    return pub(key, full);
+  }
+
+  /**
+   * Run one delivery-loop skill (implement a task, review or patch a PR, decompose specs, ...) as a single supervised
+   * session in the same sandbox as a tick. Used by the chat's run_loop_skill tool; the approval card is the confirmation.
+   */
+  async function runSkill(repo, { skill, args = '', confirm } = {}) {
+    const { full, key } = parseRepo(repo);
+    skillPrompt(skill, args); // validates before anything starts
+    guardStart(key, { confirm }, `running /delivery-loop:${skill} lets an agent push branches and open pull requests on this repository.`);
+    capCheck(key);
+    const s = state(key);
+    s.status = 'starting'; s.mode = 'skill'; s.stopping = false; s.paused = false; s.lastError = '';
+    try { await prepare(full, 'skill', { gate: RUNNABLE_SKILLS[skill].gate }); resolveClaude({ env }); } catch (e) { s.status = 'idle'; s.mode = ''; throw e; }
+    void loop(full, key, 'skill', { skill, args: String(args ?? '').trim().replace(/\s+/g, ' ') });
     await new Promise((r) => setTimeout(r, 30));
     return pub(key, full);
   }
@@ -403,5 +424,5 @@ export function createRunner({ dataDir, workRoot, runsRoot, accounts, claudeAuth
   const anyActive = () => [...live.values()].some(active);
   process.once('exit', () => { for (const s of live.values()) killTree(s.child); });
 
-  return { start, stop, stopAll, pause, resume, setup, setAutonomy, status, preflight, readiness: repoReadiness, readerFor, modulesOf, modelChoice, setModelChoice, testModels, history, log, anyActive, workspaces, limits: lim };
+  return { start, stop, stopAll, pause, resume, setup, runSkill, setAutonomy, status, preflight, readiness: repoReadiness, readerFor, modulesOf, modelChoice, setModelChoice, testModels, history, log, anyActive, workspaces, limits: lim };
 }

@@ -419,3 +419,37 @@ then gh-board keeps `MODEL_PATCH` at strong or above and measures retries (Phase
   can only report them in the final message.
 - That `acceptEdits` with `--permission-prompts none` confines reads to the workspace as documented by `--help`.
 - The reviewer comment parser against real reviewer output (it is heuristic: status word plus quoted command).
+
+## Chat skills and run_loop_skill
+
+The planner chat loads a playbook per ask with `use_skill` (`loop/skills/*.md`): lookups, planning, audits, bug triage,
+backlog grooming, specs, and one playbook per delivery-loop skill (`deliver-task`, `review-task`, `patch-task`,
+`task-status`, `decompose`, `author-spec`, `author-styleguides`, `run-loop`). The chat itself has no code tools. To act
+like the loop it calls `run_loop_skill`, which runs the plugin's real skill (`next-task`, `deliver-task`, `review-task`,
+`patch-task`, `task-status`, `decompose`, `author-spec`, `author-styleguides`, `delivery-tick`, `init`) as one session in the
+runner's sandbox: same workspace clone, scoped token, allowlist and caps as a tick, with merging denied.
+Every run needs an approval card, and "Auto-approve writes" does not cover it. Arguments are validated against a
+per-skill pattern before anything starts (`runner/command.mjs`, `RUNNABLE_SKILLS`). Progress streams into the chat; stopping
+the chat stops the run.
+
+## Remote access (Settings > Remote access)
+
+`tunnel.mjs` publishes the board to your tailnet with `tailscale serve` on HTTPS port 8443. The server stays bound to
+loopback. Turning it on creates an access key (`.tunnel.json`, git-ignored); every remote request needs it, requests
+from this computer do not. A request counts as remote if it carries proxy headers, so a forwarded request cannot pass as
+local by sending `Host: localhost`. Only this computer can turn it on or off or replace the key. It never uses Funnel,
+and it refuses a port that already serves something else. Anyone holding the link can act with your GitHub accounts and
+spend your Claude usage. The computer must stay on and awake.
+
+## Hosted board (Vercel)
+
+`vercel.json` sends every path to `api/index.mjs`, which runs the same request handler (`hosted.mjs` holds the
+differences). Set in the Vercel project: `ACCESS_KEY` (12+ characters; until then every request gets 503),
+optionally `GITHUB_TOKEN` and `AI_GATEWAY_API_KEY` (otherwise the deployment's OIDC token is offered to AI Gateway).
+`NODEJS_HELPERS=0` keeps request bodies unread for the handler. Open the site once with `?key=<ACCESS_KEY>`.
+
+Available: boards, issue view/create/update/close/comment, loop status and review pages, and a chat that reads the repo
+through the GitHub API. Not available: the runner, local code search, the Claude sign-in settings. GitHub tokens and provider keys
+added in the UI are saved, encrypted with a key derived from `ACCESS_KEY` (`vault.mjs`), in an Upstash Redis database
+connected under the project's Storage tab (`KV_REST_API_URL`, `KV_REST_API_TOKEN`). Changing `ACCESS_KEY` discards them. Chat history and
+pending approvals live in one server instance's memory, so a conversation can reset, and an approval can fail to arrive.
