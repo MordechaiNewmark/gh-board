@@ -116,7 +116,8 @@ const reasoningDuration = (timing: ThreadGroupPart["timing"]) =>
  * conversation and have no registered UI render through it instead of the
  * tool group; without it they render like any other tool call.
  * `ComposerExtra` renders in the composer's action row beside the attach
- * button.
+ * button, `ComposerEnd` in the same row before the send button, and
+ * `ComposerFooter` directly under the composer.
  */
 export type ThreadComponents = {
   AssistantMessage?: ComponentType | undefined;
@@ -131,6 +132,8 @@ export type ThreadComponents = {
     | undefined;
   TaskGroup?: ComponentType<{ group: ThreadGroupPart }> | undefined;
   ComposerExtra?: ComponentType | undefined;
+  ComposerEnd?: ComponentType | undefined;
+  ComposerFooter?: ComponentType | undefined;
 };
 
 const messageGroupBy = groupPartByType({
@@ -224,7 +227,9 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
   isEmpty,
   autoFocus,
 }) => {
-  const { Welcome = ThreadWelcome } = useContext(ThreadComponentsContext);
+  const { Welcome = ThreadWelcome, ComposerFooter } = useContext(
+    ThreadComponentsContext,
+  );
 
   return (
     <ThreadPrimitive.Root
@@ -276,6 +281,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
             <ThreadScrollToBottom />
             <ThreadFollowupSuggestions />
             <Composer autoFocus={autoFocus} />
+            {ComposerFooter && <ComposerFooter />}
             <AuiIf condition={(s) => isNewChatView(s) && s.composer.isEmpty}>
               <ThreadSuggestions />
             </AuiIf>
@@ -551,7 +557,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 };
 
 const ComposerAction: FC = () => {
-  const { ComposerExtra } = useContext(ThreadComponentsContext);
+  const { ComposerExtra, ComposerEnd } = useContext(ThreadComponentsContext);
   // The stop control only cancels the send while no run it could stop is going.
   const isSending = useAuiState(
     (s) =>
@@ -560,16 +566,17 @@ const ComposerAction: FC = () => {
   );
 
   return (
-    <div className="aui-composer-action-wrapper relative flex items-center justify-between">
+    <div className="aui-composer-action-wrapper relative flex items-center justify-between gap-2">
       {ComposerExtra ? (
-        <div className="aui-composer-action-start flex items-center gap-1.5">
+        <div className="aui-composer-action-start flex shrink-0 items-center gap-1.5">
           <ComposerAddAttachment />
           <ComposerExtra />
         </div>
       ) : (
         <ComposerAddAttachment />
       )}
-      <div className="flex items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        {ComposerEnd && <ComposerEnd />}
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
           <AuiIf condition={(s) => s.composer.dictation == null}>
             <ComposerPrimitive.Dictate asChild>

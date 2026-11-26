@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type HTMLAttributes } from "react";
 import { CircleAlertIcon, FolderGit2Icon, KanbanIcon, LockIcon, PlusIcon, RefreshCwIcon, SearchIcon, SettingsIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ActorChip } from "@/components/actor";
 import { EmptyState, GithubIcon, UserAvatar } from "@/components/issue-bits";
 import { Toaster, useToasts } from "@/components/toasts";
 import { useResizable } from "@/hooks/use-resizable";
@@ -14,8 +12,8 @@ import { api, errMsg, q, type Auth, type BoardData, type Label, type Meta, type 
 import { AuthDialog } from "./AuthDialog";
 import { IssueDialog, type IssueTarget } from "./IssueDialog";
 import { SettingsDialog } from "./SettingsDialog";
-import { AnalyzeButton, ChatWelcome } from "./chat/Analyze";
-import { ProviderNotice, ProviderPicker } from "./chat/ProviderPicker";
+import { ChatWelcome } from "./chat/Analyze";
+import { ChatControlsContext, ComposerFooter, ComposerModel, ComposerModes } from "./chat/ComposerControls";
 import { ChatRuntimeProvider, chatCtx, setChatRepo } from "./chat/runtime";
 import { Thread } from "./chat/thread";
 import { ToolCard } from "./chat/ToolCard";
@@ -33,7 +31,7 @@ import { Hierarchy, HierarchySkeleton } from "./views/Hierarchy";
 type View = "board" | "tree" | "code" | "inbox" | "repo" | "chat";
 type BoardMode = "auto" | "loop" | "classic";
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
-const THREAD_COMPONENTS = { ToolFallback: ToolCard, ToolGroup, Welcome: ChatWelcome };
+const THREAD_COMPONENTS = { ToolFallback: ToolCard, ToolGroup, Welcome: ChatWelcome, ComposerExtra: ComposerModes, ComposerEnd: ComposerModel, ComposerFooter };
 const EMPTY: BoardData = { columns: [], prefix: "status:", issues: [] };
 
 const stored = (key: string) => { try { return localStorage.getItem(key) ?? ""; } catch { return ""; } };
@@ -148,7 +146,13 @@ export default function App() {
       void load(repo);
     } catch (e) { toast(`Could not switch account: ${errMsg(e)}`, "error"); }
   };
-  useEffect(() => { if (acctFilter && !accounts.some((a) => a.login === acctFilter)) setAcctFilter(""); }, [accounts, acctFilter]);
+  const changeClaudeModel = async (model: string) => {
+    try {
+      await api("/api/settings/claude", { model });
+      await refreshAuth();
+    } catch (e) { toast(`Could not change the model: ${errMsg(e)}`, "error"); }
+  };
+  useEffect(() => { if (acctFilter &&!accounts.some((a) => a.login === acctFilter)) setAcctFilter(""); }, [accounts, acctFilter]);
 
   // Keep the chat in sync with what the board is showing.
   useEffect(() => { setChatRepo(repo); chatCtx.autoApprove = autoApprove; chatCtx.onDone = () => { void load(repo); void loop.reloadData(true); }; }, [repo, autoApprove, load, loop.reloadData]);
@@ -385,31 +389,11 @@ export default function App() {
 
           <Splitter {...chatPane.handleProps} />
           <aside id="chat" aria-label="Claude chat" className={cn("min-h-0 flex-1 flex-col bg-background md:flex md:w-[min(var(--chat-w),45vw)] md:flex-none", chat ? "flex" : "hidden")}>
-            <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-4 py-2">
-              <ProviderPicker onOpenSettings={() => setSettingsOpen(true)} />
-              <AnalyzeButton />
-              <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
-                <Checkbox checked={autoApprove} onCheckedChange={(v) => setAutoApprove(v === true)} /> Auto-approve writes
-              </label>
-              {auth.chatMode !== "classic" && (
-                <p className="w-full text-[11.5px] leading-snug text-muted-foreground" title="The chat has no tool that commits files. Code is written by the delivery loop from the issues you approve here.">
-                  <span className="font-medium text-foreground/80">Planner.</span> This chat plans with you and creates issues only. The delivery loop writes the code.
-                </p>
-              )}
-              {(actor || auth.claude) && (
-                <div className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted-foreground">
-                  {actor && <><span>GitHub writes</span><ActorChip actor={actor} onChange={changeActor} title={`Issues, comments and commits made from this chat are attributed to @${actor.login}`} /></>}
-                  {auth.claude && (
-                    <button type="button" onClick={() => setSettingsOpen(true)} title="Claude sign-in method. Click to change it in Settings."
-                      className="ml-auto rounded px-1 hover:bg-accent hover:text-foreground">
-                      Claude: {auth.plannerModel ? `${auth.plannerModel} · ` : ""}{auth.claude.label}{auth.claude.tail && <span className="font-mono"> {auth.claude.tail}</span>}{auth.claude.billing === "api" && " · API billing"}
-                    </button>
-                  )}
-                </div>
-              )}
+            <div className="min-h-0 flex-1">
+              <ChatControlsContext.Provider value={{ auth, actor, autoApprove, setAutoApprove, changeActor, changeClaudeModel, openSettings: () => setSettingsOpen(true) }}>
+                <Thread components={THREAD_COMPONENTS} />
+              </ChatControlsContext.Provider>
             </div>
-            <ProviderNotice onOpenSettings={() => setSettingsOpen(true)} />
-            <div className="min-h-0 flex-1"><Thread components={THREAD_COMPONENTS} /></div>
           </aside>
         </div>
       </div>

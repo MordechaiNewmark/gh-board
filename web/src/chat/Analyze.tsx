@@ -34,13 +34,13 @@ function useAnalyze() {
   return { repo, disabled: !repo || running, run: (prompt: string) => aui.thread().append(prompt) };
 }
 
-/* Chat header action: one click starts the full audit on the selected repo. */
+/* Composer action: one click starts the full audit on the selected repo. */
 export function AnalyzeButton() {
   const { repo, disabled, run } = useAnalyze();
   return (
-    <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs" disabled={disabled} onClick={() => run(ANALYSES[1].prompt)}
-      title={repo ? `Explore all of ${repo} and propose a backlog of issues` : "Pick a repository first"}>
-      <ScanSearchIcon aria-hidden className="size-3.5" />Analyze repo
+    <Button type="button" variant="outline" size="sm" className="h-7 gap-1.5 rounded-full bg-transparent px-2 text-xs shadow-none" disabled={disabled} onClick={() => run(ANALYSES[1].prompt)}
+      aria-label="Analyze repo" title={repo ? `Analyze repo: explore all of ${repo} and propose a backlog of issues` : "Pick a repository first"}>
+      <ScanSearchIcon aria-hidden className="size-3.5" /><span className="hidden @[32rem]:inline">Analyze repo</span>
     </Button>
   );
 }
